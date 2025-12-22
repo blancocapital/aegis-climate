@@ -4,11 +4,15 @@ from typing import Optional
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from passlib.context import CryptContext
 
-from .config import get_settings
+from app.core.config import get_settings
+from app.db import SessionLocal
+from app.models import User
 
 
 security = HTTPBearer(auto_error=False)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 class TokenData:
@@ -16,6 +20,14 @@ class TokenData:
         self.tenant_id = tenant_id
         self.role = role
         self.user_id = user_id
+
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
 
 
 def create_access_token(tenant_id: str, role: str, user_id: str, expires_minutes: Optional[int] = None) -> str:

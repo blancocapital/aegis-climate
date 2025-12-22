@@ -1,3 +1,16 @@
 fastapi
 uvicorn
 pyjwt
+sqlalchemy>=2.0
+psycopg2-binary
+alembic
+pydantic
+python-multipart
+passlib[bcrypt]
+boto3
+celery[redis]
+redis
+geoalchemy2
+python-dotenv
+pytest
+pydantic-settings
