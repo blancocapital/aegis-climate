@@ -35,6 +35,8 @@ services:
       AEGIS_MINIO_ACCESS_KEY: minioadmin
       AEGIS_MINIO_SECRET_KEY: minioadmin
       AEGIS_MINIO_BUCKET: aegis-data
+      AEGIS_SECRET_KEY: devsecret
+      AEGIS_CODE_VERSION: dev
     ports:
       - "8000:8000"
     depends_on:
@@ -54,6 +56,8 @@ services:
       AEGIS_MINIO_ACCESS_KEY: minioadmin
       AEGIS_MINIO_SECRET_KEY: minioadmin
       AEGIS_MINIO_BUCKET: aegis-data
+      AEGIS_SECRET_KEY: devsecret
+      AEGIS_CODE_VERSION: dev
     depends_on:
       - postgres
       - redis

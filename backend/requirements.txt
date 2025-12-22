@@ -1,5 +1,5 @@
 fastapi
-uvicorn
+uvicorn[standard]
 pyjwt
 sqlalchemy>=2.0
 psycopg2-binary
@@ -8,9 +8,11 @@ pydantic
 python-multipart
 passlib[bcrypt]
 boto3
+botocore
 celery[redis]
 redis
 geoalchemy2
 python-dotenv
 pytest
 pydantic-settings
+httpx
