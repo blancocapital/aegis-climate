@@ -44,14 +44,14 @@ Derived from `docs/mvp-technical-specification.md` (source of truth), with align
 - [ ] breach workflow: statuses OPEN → ACKED → RESOLVED; PATCH endpoint enforces transitions.
 
 ## Drift
-- [ ] POST /drift compares exposure_version A vs B keyed by external_location_id; classify NEW/REMOVED/MODIFIED with numeric deltas.
-- [ ] Aggregate drift by configured dimensions; export artifact to object storage; register run.
-- [ ] GET /drift/{id} summary; GET /drift/{id}/details detailed diffs.
+- [x] POST /drift compares exposure_version A vs B keyed by external_location_id; classify NEW/REMOVED/MODIFIED with numeric deltas.
+- [x] Aggregate drift by configured dimensions; export artifact to object storage; register run.
+- [x] GET /drift/{id} summary; GET /drift/{id}/details detailed diffs.
 
 ## Governance
-- [ ] run registry for VALIDATION, GEOCODE, OVERLAY, ROLLUP, BREACH_EVAL, DRIFT with input_refs, config_refs, output_refs, code_version, checksums where applicable.
-- [ ] Lineage endpoint returns dependencies for any output (e.g., rollup_result → exposure_version + overlays + configs + runs + users + timestamps).
-- [ ] Audit events append-only for sensitive actions (login, role changes, mapping changes, exposure commit, hazard dataset version creation, threshold changes, breach status changes, exports, config changes).
+- [x] run registry for VALIDATION, GEOCODE, OVERLAY, ROLLUP, BREACH_EVAL, DRIFT with input_refs, config_refs, output_refs, code_version, checksums where applicable.
+- [x] Lineage endpoint returns dependencies for any output (e.g., rollup_result → exposure_version + overlays + configs + runs + users + timestamps).
+- [x] Audit events append-only for sensitive actions (login, role changes, mapping changes, exposure commit, hazard dataset version creation, threshold changes, breach status changes, exports, config changes).
 
 ## Frontend (React + Vite)
 - [ ] Screens: Upload & Mapping; Validation summary + row error explorer; Exceptions queue; Accumulation dashboard (rollups + drilldown); Threshold builder + breach list (status updates); Drift report compare A vs B; Governance views (Versions/Runs/Lineage); Audit log viewer.
