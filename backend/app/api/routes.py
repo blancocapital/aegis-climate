@@ -1,151 +1,346 @@
+import io
+import json
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+import jwt
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Header
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 
-from ..core.auth import TokenData, create_access_token, get_current_user, require_role
+from app.core.auth import TokenData, create_access_token, require_role, verify_password
+from app.core.config import get_settings
+from app.db import get_db
+from app.jobs.celery_app import commit_upload as commit_task
+from app.jobs.celery_app import validate_upload as validate_task
+from app.jobs.celery_app import geocode_and_score as geocode_task
+from app.models import (
+    AuditEvent,
+    ExposureUpload,
+    ExposureVersion,
+    Location,
+    MappingTemplate,
+    Run,
+    RunStatus,
+    RunType,
+    Tenant,
+    User,
+    UserRole,
+    ValidationResult,
+)
+from app.storage.s3 import compute_checksum, put_object, get_object
 
 router = APIRouter()
+settings = get_settings()
+
+
+def emit_audit(session: Session, tenant_id: str, user_id: Optional[str], action: str, metadata: Optional[dict] = None):
+    event = AuditEvent(tenant_id=tenant_id, user_id=user_id, action=action, metadata=metadata or {})
+    session.add(event)
+    session.commit()
 
 
 @router.post("/auth/login")
-def login(tenant_id: str, user_id: str, role: str) -> Dict[str, str]:
-    token = create_access_token(tenant_id=tenant_id, role=role, user_id=user_id)
+def login(payload: Dict[str, str], db: Session = Depends(get_db)) -> Dict[str, str]:
+    email = payload.get("email")
+    password = payload.get("password")
+    tenant_id = payload.get("tenant_id")
+    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    if tenant_id and user.tenant_id != tenant_id:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid tenant")
+    if not verify_password(password or "", user.password_hash):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    token = create_access_token(tenant_id=user.tenant_id, role=user.role.value, user_id=user.id)
+    emit_audit(db, user.tenant_id, user.id, "login")
     return {"access_token": token, "token_type": "bearer"}
 
 
 @router.post("/uploads")
-def create_upload(user: TokenData = Depends(require_role("ADMIN", "OPS"))) -> Dict[str, Any]:
+def create_upload(
+    file: UploadFile = File(...),
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
+) -> Dict[str, Any]:
+    existing = None
+    if idempotency_key:
+        existing = db.execute(
+            select(ExposureUpload).where(
+                ExposureUpload.tenant_id == user.tenant_id,
+                ExposureUpload.idempotency_key == idempotency_key,
+            )
+        ).scalar_one_or_none()
+    if existing:
+        return {"upload_id": existing.id, "object_uri": existing.object_uri}
+
+    content = file.file.read()
+    checksum = compute_checksum(content)
     upload_id = str(uuid.uuid4())
-    return {"upload_id": upload_id, "upload_url": f"s3://uploads/{upload_id}"}
+    key = f"uploads/{user.tenant_id}/{upload_id}/{file.filename}"
+    uri = put_object(key, content, content_type=file.content_type or "text/csv")
+    upload = ExposureUpload(
+        id=upload_id,
+        tenant_id=user.tenant_id,
+        filename=file.filename,
+        object_uri=uri,
+        checksum=checksum,
+        idempotency_key=idempotency_key,
+        created_by=user.user_id,
+    )
+    db.add(upload)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "upload_created", {"upload_id": upload_id})
+    return {"upload_id": upload_id, "object_uri": uri}
 
 
 @router.post("/uploads/{upload_id}/mapping")
-def attach_mapping(upload_id: str, mapping_name: str, version: int = 1, user: TokenData = Depends(require_role("ADMIN", "OPS"))) -> Dict[str, Any]:
-    return {"upload_id": upload_id, "mapping_template": {"name": mapping_name, "version": version}}
+def attach_mapping(
+    upload_id: str,
+    mapping: Dict[str, str],
+    name: str = "default",
+    version: int = 1,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    upload = db.get(ExposureUpload, upload_id)
+    if not upload or upload.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+    current_version = db.execute(
+        select(func.max(MappingTemplate.version)).where(
+            MappingTemplate.tenant_id == user.tenant_id, MappingTemplate.name == name
+        )
+    ).scalar()
+    template = MappingTemplate(
+        tenant_id=user.tenant_id,
+        name=name,
+        version=(current_version or 0) + 1,
+        template_json=mapping,
+        created_by=user.user_id,
+    )
+    db.add(template)
+    db.commit()
+    upload.mapping_template_id = template.id
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "mapping_attached", {"upload_id": upload_id})
+    return {"mapping_template_id": template.id}
 
 
 @router.post("/uploads/{upload_id}/validate")
-def validate_upload(upload_id: str, user: TokenData = Depends(require_role("ADMIN", "OPS"))) -> Dict[str, Any]:
-    job_id = str(uuid.uuid4())
-    return {"upload_id": upload_id, "job_id": job_id, "summary": {"errors": 0, "warnings": 0}, "row_errors_uri": f"s3://validations/{upload_id}/errors.json"}
+def trigger_validate(
+    upload_id: str,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    upload = db.get(ExposureUpload, upload_id)
+    if not upload or upload.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.VALIDATION,
+        status=RunStatus.QUEUED,
+        input_refs_json={"upload_id": upload_id},
+        config_refs_json={"mapping_template_id": upload.mapping_template_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    validate_task.delay(run.id, upload_id, user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "validation_requested", {"upload_id": upload_id})
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.post("/uploads/{upload_id}/commit")
-def commit_upload(upload_id: str, name: Optional[str] = None, user: TokenData = Depends(require_role("ADMIN", "OPS"))) -> Dict[str, Any]:
-    exposure_version_id = str(uuid.uuid4())
-    return {"exposure_version_id": exposure_version_id, "name": name or f"Exposure {upload_id}"}
+def trigger_commit(
+    upload_id: str,
+    name: Optional[str] = None,
+    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    upload = db.get(ExposureUpload, upload_id)
+    if not upload or upload.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+    existing = None
+    if idempotency_key:
+        existing = db.execute(
+            select(ExposureVersion).where(
+                ExposureVersion.tenant_id == user.tenant_id,
+                ExposureVersion.upload_id == upload_id,
+                ExposureVersion.idempotency_key == idempotency_key,
+            )
+        ).scalar_one_or_none()
+    if existing:
+        return {"exposure_version_id": existing.id}
+    latest_vr = db.execute(
+        select(ValidationResult).where(
+            ValidationResult.upload_id == upload_id,
+            ValidationResult.tenant_id == user.tenant_id,
+        ).order_by(ValidationResult.created_at.desc())
+    ).scalar_one_or_none()
+    if not latest_vr or latest_vr.summary_json.get("ERROR"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Validation errors present")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.COMMIT,
+        status=RunStatus.QUEUED,
+        input_refs_json={"upload_id": upload_id},
+        config_refs_json={"mapping_template_id": upload.mapping_template_id, "idempotency_key": idempotency_key},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    commit_task.delay(run.id, upload_id, user.tenant_id, name or f"Exposure {upload_id}")
+    emit_audit(db, user.tenant_id, user.user_id, "commit_requested", {"upload_id": upload_id})
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.get("/exposure-versions")
-def list_exposure_versions(user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"items": []}
+def list_exposure_versions(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    rows = db.execute(select(ExposureVersion).where(ExposureVersion.tenant_id == user.tenant_id)).scalars().all()
+    return {"items": [
+        {"id": ev.id, "name": ev.name, "upload_id": ev.upload_id, "created_at": ev.created_at.isoformat()}
+        for ev in rows
+    ]}
 
 
 @router.get("/exposure-versions/{exposure_version_id}/summary")
-def exposure_summary(exposure_version_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"exposure_version_id": exposure_version_id, "locations": 0, "tiv": 0}
+def exposure_summary(exposure_version_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    count = db.execute(select(func.count()).select_from(Location).where(Location.exposure_version_id == ev.id, Location.tenant_id == user.tenant_id)).scalar_one()
+    tiv_sum = db.execute(select(func.sum(Location.tiv)).where(Location.exposure_version_id == ev.id, Location.tenant_id == user.tenant_id)).scalar()
+    return {"exposure_version_id": ev.id, "locations": count, "tiv": tiv_sum or 0}
 
 
 @router.get("/exposure-versions/{exposure_version_id}/locations")
-def exposure_locations(exposure_version_id: str, page: int = 1, page_size: int = 50, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"exposure_version_id": exposure_version_id, "page": page, "page_size": page_size, "items": []}
+def exposure_locations(exposure_version_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    rows = db.execute(select(Location).where(Location.exposure_version_id == ev.id, Location.tenant_id == user.tenant_id)).scalars().all()
+    return {"items": [
+        {
+            "external_location_id": r.external_location_id,
+            "address_line1": r.address_line1,
+            "city": r.city,
+            "country": r.country,
+            "latitude": r.latitude,
+            "longitude": r.longitude,
+        }
+        for r in rows
+    ]}
 
 
 @router.get("/exposure-versions/{exposure_version_id}/exceptions")
-def exposure_exceptions(exposure_version_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"exposure_version_id": exposure_version_id, "items": []}
+def exposure_exceptions(exposure_version_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    vr = db.execute(select(ValidationResult).where(ValidationResult.upload_id == ev.upload_id, ValidationResult.tenant_id == user.tenant_id)).scalar_one_or_none()
+    if not vr:
+        issues = []
+    else:
+        issues = json.loads(get_object(vr.row_errors_uri.split(f"s3://{settings.minio_bucket}/",1)[1]).decode())
+    quality_rows = db.execute(
+        select(Location).where(
+            Location.exposure_version_id == ev.id,
+            Location.tenant_id == user.tenant_id,
+            Location.quality_tier == "C",
+        )
+    ).scalars().all()
+    items = []
+    for loc in quality_rows:
+        items.append({
+            "type": "QUALITY_TIER_C",
+            "external_location_id": loc.external_location_id,
+            "quality_tier": loc.quality_tier,
+            "reasons": loc.quality_reasons_json or [],
+            "geocode_confidence": loc.geocode_confidence,
+        })
+    for issue in issues:
+        items.append({"type": "VALIDATION_ISSUE", **issue})
+    return {"items": items}
 
 
-@router.post("/hazard-overlays")
-def run_overlay(exposure_version_id: str, hazard_dataset_version_ids: List[str], user: TokenData = Depends(require_role("ADMIN", "OPS", "ANALYST"))) -> Dict[str, Any]:
-    overlay_id = str(uuid.uuid4())
-    return {"hazard_overlay_result_id": overlay_id, "status": "QUEUED"}
-
-
-@router.get("/hazard-overlays/{overlay_id}/status")
-def overlay_status(overlay_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"hazard_overlay_result_id": overlay_id, "status": "SUCCEEDED"}
-
-
-@router.get("/hazard-overlays/{overlay_id}/summary")
-def overlay_summary(overlay_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"hazard_overlay_result_id": overlay_id, "summary": {}}
-
-
-@router.post("/rollup-configs")
-def create_rollup_config(name: str, user: TokenData = Depends(require_role("ADMIN", "ANALYST"))) -> Dict[str, Any]:
-    return {"rollup_config_id": str(uuid.uuid4()), "name": name}
-
-
-@router.post("/rollups")
-def run_rollup(exposure_version_id: str, rollup_config_id: str, hazard_overlay_result_ids: Optional[List[str]] = None, user: TokenData = Depends(require_role("ADMIN", "OPS", "ANALYST"))) -> Dict[str, Any]:
-    rollup_id = str(uuid.uuid4())
-    return {"rollup_result_id": rollup_id, "status": "QUEUED"}
-
-
-@router.get("/rollups/{rollup_id}")
-def get_rollup(rollup_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"rollup_result_id": rollup_id, "data": []}
-
-
-@router.get("/rollups/{rollup_id}/drilldown")
-def rollup_drilldown(rollup_id: str, rollup_key: str = Query(..., description="Composite rollup key"), user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"rollup_result_id": rollup_id, "rollup_key": rollup_key, "contributors": []}
-
-
-@router.post("/threshold-rules")
-def create_threshold(name: str, severity: str, user: TokenData = Depends(require_role("ADMIN", "ANALYST"))) -> Dict[str, Any]:
-    return {"threshold_rule_id": str(uuid.uuid4()), "name": name, "severity": severity}
-
-
-@router.post("/breaches/run")
-def run_breaches(exposure_version_id: str, threshold_rule_ids: List[str], rollup_result_id: str, user: TokenData = Depends(require_role("ADMIN", "OPS", "ANALYST"))) -> Dict[str, Any]:
-    breach_ids = [str(uuid.uuid4()) for _ in threshold_rule_ids]
-    return {"breach_ids": breach_ids, "status": "SUCCEEDED"}
-
-
-@router.get("/breaches")
-def list_breaches(exposure_version_id: Optional[str] = None, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"items": []}
-
-
-@router.patch("/breaches/{breach_id}")
-def update_breach(breach_id: str, status: str, user: TokenData = Depends(require_role("ADMIN", "OPS"))) -> Dict[str, Any]:
-    if status not in {"OPEN", "ACKED", "RESOLVED"}:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
-    return {"breach_id": breach_id, "status": status}
-
-
-@router.post("/drift")
-def run_drift(exposure_version_a: str, exposure_version_b: str, user: TokenData = Depends(require_role("ADMIN", "OPS", "ANALYST"))) -> Dict[str, Any]:
-    drift_id = str(uuid.uuid4())
-    return {"drift_run_id": drift_id, "status": "QUEUED"}
-
-
-@router.get("/drift/{drift_run_id}")
-def drift_summary(drift_run_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"drift_run_id": drift_run_id, "summary": {}}
-
-
-@router.get("/drift/{drift_run_id}/details")
-def drift_details(drift_run_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"drift_run_id": drift_run_id, "items": []}
+@router.post("/exposure-versions/{exposure_version_id}/geocode")
+def trigger_geocode(
+    exposure_version_id: int,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.GEOCODE,
+        status=RunStatus.QUEUED,
+        input_refs_json={"exposure_version_id": exposure_version_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    geocode_task.delay(run.id, exposure_version_id, user.tenant_id)
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.get("/runs/{run_id}")
-def get_run(run_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"run_id": run_id, "status": "SUCCEEDED"}
-
-
-@router.get("/lineage")
-def get_lineage(entity_type: str, entity_id: str, user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"entity_type": entity_type, "entity_id": entity_id, "lineage": []}
+def get_run(run_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    run = db.get(Run, run_id)
+    if not run or run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return {"id": run.id, "status": run.status}
 
 
 @router.get("/audit-events")
-def list_audit_events(user: TokenData = Depends(get_current_user)) -> Dict[str, Any]:
-    return {"items": []}
+def list_audit_events(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    events = db.execute(select(AuditEvent).where(AuditEvent.tenant_id == user.tenant_id).order_by(AuditEvent.created_at.desc())).scalars().all()
+    return {"items": [
+        {"action": e.action, "created_at": e.created_at.isoformat(), "user_id": e.user_id, "metadata": e.metadata}
+        for e in events
+    ]}
 
 
 @router.get("/health")

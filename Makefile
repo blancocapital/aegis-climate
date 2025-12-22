@@ -18,7 +18,10 @@ frontend:
 	cd frontend && npm install && npm run dev -- --host 0.0.0.0
 
 migrate:
-	@echo "Migrations not implemented yet"
+	cd backend && alembic upgrade head
 
 seed:
-	@echo "Seed script placeholder"
+	cd backend && python -m seed
+
+test:
+	cd backend && pytest
