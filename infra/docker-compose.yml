@@ -29,8 +29,31 @@ services:
       dockerfile: backend/Dockerfile
     environment:
       AEGIS_ENVIRONMENT: docker
+      AEGIS_DATABASE_URL: postgresql+psycopg2://aegis:example@postgres:5432/aegis
+      AEGIS_REDIS_URL: redis://redis:6379/0
+      AEGIS_MINIO_ENDPOINT: http://minio:9000
+      AEGIS_MINIO_ACCESS_KEY: minioadmin
+      AEGIS_MINIO_SECRET_KEY: minioadmin
+      AEGIS_MINIO_BUCKET: aegis-data
     ports:
       - "8000:8000"
+    depends_on:
+      - postgres
+      - redis
+      - minio
+  worker:
+    build:
+      context: ..
+      dockerfile: backend/Dockerfile
+    command: celery -A app.jobs.celery_app.celery_app worker --loglevel=info
+    environment:
+      AEGIS_ENVIRONMENT: docker
+      AEGIS_DATABASE_URL: postgresql+psycopg2://aegis:example@postgres:5432/aegis
+      AEGIS_REDIS_URL: redis://redis:6379/0
+      AEGIS_MINIO_ENDPOINT: http://minio:9000
+      AEGIS_MINIO_ACCESS_KEY: minioadmin
+      AEGIS_MINIO_SECRET_KEY: minioadmin
+      AEGIS_MINIO_BUCKET: aegis-data
     depends_on:
       - postgres
       - redis
