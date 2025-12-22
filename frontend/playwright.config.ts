@@ -10,10 +10,11 @@ export default defineConfig({
   expect: {
     timeout: 20000,
   },
-  outputDir: 'test-results',
+  outputDir: path.join(__dirname, '..', 'test-results'),
   reporter: [
     ['list'],
     ['json', { outputFile: path.join(__dirname, '..', 'qa-results.json') }],
+    ['html', { outputFolder: path.join(__dirname, '..', 'playwright-report'), open: 'never' }],
   ],
   use: {
     baseURL: process.env.PLAYWRIGHT_BASE_URL || 'http://localhost:5173',
