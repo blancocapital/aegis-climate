@@ -1,5 +1,6 @@
 from app.services.validation import validate_rows
 from app.services.commit import canonicalize_rows
+from app.services.validation import validate_rows
 
 
 def test_validation_determinism():

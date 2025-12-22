@@ -7,7 +7,22 @@ from sqlalchemy import select
 
 from app.core.config import get_settings
 from app.db import SessionLocal
-from app.models import ExposureUpload, Location, MappingTemplate, Run, RunStatus, RunType, ValidationResult, ExposureVersion
+from sqlalchemy import func
+from app.models import (
+    ExposureUpload,
+    Location,
+    MappingTemplate,
+    Run,
+    RunStatus,
+    RunType,
+    ValidationResult,
+    ExposureVersion,
+    Tenant,
+    HazardDatasetVersion,
+    HazardFeaturePolygon,
+    HazardOverlayResult,
+    LocationHazardAttribute,
+)
 from app.services.validation import read_csv_bytes, validate_rows
 from app.services.commit import canonicalize_rows, to_location_dict
 from app.services.geocode import geocode_address
@@ -80,6 +95,7 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
         if not upload:
             raise ValueError("upload not found")
         mapping = session.get(MappingTemplate, upload.mapping_template_id) if upload.mapping_template_id else None
+        tenant = session.get(Tenant, tenant_id)
         key = upload.object_uri.split(f"s3://{settings.minio_bucket}/", 1)[1]
         raw_bytes = get_object(key)
         rows = canonicalize_rows(raw_bytes, mapping.template_json if mapping else {})
@@ -95,6 +111,8 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
         locations = []
         for mapped in rows:
             loc_dict = to_location_dict(mapped)
+            if not (loc_dict.get("lob") or loc_dict.get("product_code")):
+                continue
             locations.append(
                 Location(
                     tenant_id=tenant_id,
@@ -102,9 +120,14 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
                     external_location_id=str(loc_dict.get("external_location_id")),
                     address_line1=loc_dict.get("address_line1"),
                     city=loc_dict.get("city"),
+                    state_region=loc_dict.get("state_region"),
+                    postal_code=loc_dict.get("postal_code"),
                     country=loc_dict.get("country"),
                     latitude=loc_dict.get("latitude"),
                     longitude=loc_dict.get("longitude"),
+                    currency=(loc_dict.get("currency") or (tenant.default_currency if tenant else None)),
+                    lob=loc_dict.get("lob"),
+                    product_code=loc_dict.get("product_code"),
                     tiv=loc_dict.get("tiv"),
                     limit=loc_dict.get("limit"),
                     premium=loc_dict.get("premium"),
@@ -162,6 +185,94 @@ def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str):
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
         run.output_refs_json = {"exposure_version_id": exposure_version_id}
+        run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def overlay_hazard(run_id: int, exposure_version_id: int, hazard_dataset_version_id: int, tenant_id: str, params: Dict | None = None):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    if not run or run.tenant_id != tenant_id:
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        ev = session.get(ExposureVersion, exposure_version_id)
+        if not ev:
+            raise ValueError("exposure version not found")
+        hdv = session.get(HazardDatasetVersion, hazard_dataset_version_id)
+        if not hdv or hdv.tenant_id != tenant_id:
+            raise ValueError("hazard dataset version not found")
+        overlay_result = HazardOverlayResult(
+            tenant_id=tenant_id,
+            exposure_version_id=exposure_version_id,
+            hazard_dataset_version_id=hazard_dataset_version_id,
+            method="POSTGIS_SPATIAL_JOIN",
+            params_json=params or {},
+            run_id=run_id,
+        )
+        session.add(overlay_result)
+        session.commit()
+        locations = session.query(Location).filter(
+            Location.tenant_id == tenant_id,
+            Location.exposure_version_id == exposure_version_id,
+        ).all()
+        saved_attrs = []
+        for loc in locations:
+            if loc.latitude is None or loc.longitude is None:
+                continue
+            geom_point = func.ST_SetSRID(func.ST_MakePoint(loc.longitude, loc.latitude), 4326)
+            feature = (
+                session.query(HazardFeaturePolygon)
+                .filter(
+                    HazardFeaturePolygon.tenant_id == tenant_id,
+                    HazardFeaturePolygon.hazard_dataset_version_id == hazard_dataset_version_id,
+                    func.ST_Contains(HazardFeaturePolygon.geom, geom_point),
+                )
+                .order_by(HazardFeaturePolygon.id.asc())
+                .first()
+            )
+            if not feature:
+                continue
+            props = feature.properties_json or {}
+            attributes = {
+                "hazard_category": props.get("peril") or props.get("hazard") or "",
+                "band": props.get("band") or props.get("Band"),
+                "percentile": props.get("percentile"),
+                "score": props.get("score"),
+                "source": f"{hdv.hazard_dataset_id}:{hdv.version_label}",
+                "method": "POSTGIS_SPATIAL_JOIN",
+                "raw": props,
+            }
+            saved_attrs.append(
+                LocationHazardAttribute(
+                    tenant_id=tenant_id,
+                    location_id=loc.id,
+                    hazard_overlay_result_id=overlay_result.id,
+                    attributes_json=attributes,
+                )
+            )
+        if saved_attrs:
+            session.bulk_save_objects(saved_attrs)
+        session.commit()
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {
+            "hazard_overlay_result_id": overlay_result.id,
+            "summary": {
+                "locations": len(locations),
+                "attributes_created": len(saved_attrs),
+            },
+        }
         run.code_version = settings.code_version
         session.commit()
     except Exception:

@@ -6,7 +6,7 @@ from app.models import Tenant, User, UserRole
 
 def seed():
     session = SessionLocal()
-    tenant = Tenant(id="demo", name="Demo Tenant")
+    tenant = Tenant(id="demo", name="Demo Tenant", default_currency="USD")
     session.merge(tenant)
     users = [
         ("admin@demo.com", UserRole.ADMIN),

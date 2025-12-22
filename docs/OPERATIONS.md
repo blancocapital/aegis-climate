@@ -17,7 +17,8 @@
 - `make seed` seeds demo tenant and users with password `password`. Safe to re-run.
 
 ## Jobs
-- Celery worker runs in compose `worker` service. Validation/commit/geocode endpoints enqueue tasks using Redis broker.
+- Celery worker runs in compose `worker` service. Validation/commit/geocode/hazard overlay endpoints enqueue tasks using Redis broker.
+- Hazard overlay uses PostGIS spatial functions; ensure migrations ran after enabling PostGIS extension.
 
 ## Troubleshooting
 - Verify env vars (AEGIS_DATABASE_URL, AEGIS_MINIO_* , AEGIS_REDIS_URL) are consistent between api and worker.

@@ -15,6 +15,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
 )
+from geoalchemy2 import Geometry
 from sqlalchemy.orm import declarative_base, relationship
 
 Base = declarative_base()
@@ -32,6 +33,7 @@ class RunType(str, enum.Enum):
     VALIDATION = "VALIDATION"
     COMMIT = "COMMIT"
     GEOCODE = "GEOCODE"
+    OVERLAY = "OVERLAY"
 
 
 class RunStatus(str, enum.Enum):
@@ -46,6 +48,7 @@ class Tenant(Base):
 
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False, unique=True)
+    default_currency = Column(String, nullable=False, default="USD")
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 
@@ -126,6 +129,7 @@ class MappingTemplate(Base):
     name = Column(String, nullable=False)
     version = Column(Integer, nullable=False)
     template_json = Column(JSON, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (
@@ -171,9 +175,14 @@ class Location(Base):
     external_location_id = Column(String, nullable=False)
     address_line1 = Column(String, nullable=True)
     city = Column(String, nullable=True)
+    state_region = Column(String, nullable=True)
+    postal_code = Column(String, nullable=True)
     country = Column(String, nullable=True)
     latitude = Column(Float, nullable=True)
     longitude = Column(Float, nullable=True)
+    currency = Column(String, nullable=True)
+    lob = Column(String, nullable=True)
+    product_code = Column(String, nullable=True)
     tiv = Column(Float, nullable=True)
     limit = Column(Float, nullable=True)
     premium = Column(Float, nullable=True)
@@ -188,3 +197,77 @@ class Location(Base):
         UniqueConstraint("tenant_id", "exposure_version_id", "external_location_id", name="uq_location_unique"),
         Index("ix_location_tenant_created", "tenant_id", "created_at"),
     )
+
+
+class HazardDataset(Base):
+    __tablename__ = "hazard_dataset"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    peril = Column(String, nullable=False)
+    vendor = Column(String, nullable=True)
+    coverage_geo = Column(String, nullable=True)
+    license_ref = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_hazard_dataset_tenant_created", "tenant_id", "created_at"),)
+
+
+class HazardDatasetVersion(Base):
+    __tablename__ = "hazard_dataset_version"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    hazard_dataset_id = Column(Integer, ForeignKey("hazard_dataset.id", ondelete="CASCADE"), nullable=False)
+    version_label = Column(String, nullable=False)
+    storage_uri = Column(String, nullable=False)
+    checksum = Column(String, nullable=False)
+    effective_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_hazard_dataset_version_tenant_created", "tenant_id", "created_at"),
+        UniqueConstraint("tenant_id", "hazard_dataset_id", "version_label", name="uq_hazard_dataset_version"),
+    )
+
+
+class HazardFeaturePolygon(Base):
+    __tablename__ = "hazard_feature_polygon"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    hazard_dataset_version_id = Column(Integer, ForeignKey("hazard_dataset_version.id", ondelete="CASCADE"), nullable=False)
+    geom = Column(Geometry("MULTIPOLYGON", srid=4326))
+    properties_json = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_hazard_feature_polygon_tenant", "tenant_id"),
+    )
+
+
+class HazardOverlayResult(Base):
+    __tablename__ = "hazard_overlay_result"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    hazard_dataset_version_id = Column(Integer, ForeignKey("hazard_dataset_version.id", ondelete="CASCADE"), nullable=False)
+    method = Column(String, nullable=False)
+    params_json = Column(JSON, nullable=True)
+    run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_hazard_overlay_tenant_created", "tenant_id", "created_at"),)
+
+
+class LocationHazardAttribute(Base):
+    __tablename__ = "location_hazard_attribute"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    location_id = Column(Integer, ForeignKey("location.id", ondelete="CASCADE"), nullable=False)
+    hazard_overlay_result_id = Column(Integer, ForeignKey("hazard_overlay_result.id", ondelete="CASCADE"), nullable=False)
+    attributes_json = Column(JSON, nullable=False)
+
+    __table_args__ = (Index("ix_location_hazard_attr_tenant", "tenant_id"),)

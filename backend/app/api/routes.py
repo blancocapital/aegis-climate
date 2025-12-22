@@ -1,11 +1,13 @@
 import io
 import json
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
+from pydantic import BaseModel
 
 import jwt
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Header
-from sqlalchemy import func, select
+from sqlalchemy import func, select, or_, and_
 from sqlalchemy.orm import Session
 
 from app.core.auth import TokenData, create_access_token, require_role, verify_password
@@ -27,8 +29,14 @@ from app.models import (
     User,
     UserRole,
     ValidationResult,
+    HazardDataset,
+    HazardDatasetVersion,
+    HazardFeaturePolygon,
+    HazardOverlayResult,
+    LocationHazardAttribute,
 )
 from app.storage.s3 import compute_checksum, put_object, get_object
+from app.jobs.celery_app import overlay_hazard as overlay_task
 
 router = APIRouter()
 settings = get_settings()
@@ -38,6 +46,25 @@ def emit_audit(session: Session, tenant_id: str, user_id: Optional[str], action:
     event = AuditEvent(tenant_id=tenant_id, user_id=user_id, action=action, metadata=metadata or {})
     session.add(event)
     session.commit()
+
+
+class MappingRequest(BaseModel):
+    name: str = "default"
+    mapping_json: Dict[str, str]
+
+
+class HazardDatasetCreate(BaseModel):
+    name: str
+    peril: str
+    vendor: Optional[str] = None
+    coverage_geo: Optional[str] = None
+    license_ref: Optional[str] = None
+
+
+class HazardOverlayRequest(BaseModel):
+    exposure_version_id: int
+    hazard_dataset_version_ids: List[int]
+    params: Optional[Dict[str, Any]] = None
 
 
 @router.post("/auth/login")
@@ -62,7 +89,7 @@ def create_upload(
     file: UploadFile = File(...),
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
-    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
 ) -> Dict[str, Any]:
     existing = None
     if idempotency_key:
@@ -98,9 +125,7 @@ def create_upload(
 @router.post("/uploads/{upload_id}/mapping")
 def attach_mapping(
     upload_id: str,
-    mapping: Dict[str, str],
-    name: str = "default",
-    version: int = 1,
+    mapping_req: MappingRequest,
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -109,14 +134,14 @@ def attach_mapping(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
     current_version = db.execute(
         select(func.max(MappingTemplate.version)).where(
-            MappingTemplate.tenant_id == user.tenant_id, MappingTemplate.name == name
+            MappingTemplate.tenant_id == user.tenant_id, MappingTemplate.name == mapping_req.name
         )
     ).scalar()
     template = MappingTemplate(
         tenant_id=user.tenant_id,
-        name=name,
+        name=mapping_req.name,
         version=(current_version or 0) + 1,
-        template_json=mapping,
+        template_json=mapping_req.mapping_json,
         created_by=user.user_id,
     )
     db.add(template)
@@ -124,7 +149,7 @@ def attach_mapping(
     upload.mapping_template_id = template.id
     db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "mapping_attached", {"upload_id": upload_id})
-    return {"mapping_template_id": template.id}
+    return {"mapping_template_id": template.id, "name": template.name, "version": template.version}
 
 
 @router.post("/uploads/{upload_id}/validate")
@@ -156,24 +181,33 @@ def trigger_validate(
 def trigger_commit(
     upload_id: str,
     name: Optional[str] = None,
-    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     upload = db.get(ExposureUpload, upload_id)
     if not upload or upload.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
-    existing = None
+    existing = db.execute(
+        select(ExposureVersion).where(
+            ExposureVersion.tenant_id == user.tenant_id,
+            ExposureVersion.upload_id == upload_id,
+            ExposureVersion.mapping_template_id == upload.mapping_template_id,
+        )
+    ).scalar_one_or_none()
+    if existing:
+        response = {"exposure_version_id": existing.id, "note": "existing_exposure_version_returned"}
+        return response
     if idempotency_key:
-        existing = db.execute(
+        existing_key = db.execute(
             select(ExposureVersion).where(
                 ExposureVersion.tenant_id == user.tenant_id,
                 ExposureVersion.upload_id == upload_id,
                 ExposureVersion.idempotency_key == idempotency_key,
             )
         ).scalar_one_or_none()
-    if existing:
-        return {"exposure_version_id": existing.id}
+        if existing_key:
+            return {"exposure_version_id": existing_key.id, "note": "existing_exposure_version_returned"}
     latest_vr = db.execute(
         select(ValidationResult).where(
             ValidationResult.upload_id == upload_id,
@@ -265,22 +299,29 @@ def exposure_exceptions(exposure_version_id: int, user: TokenData = Depends(requ
     ev = db.get(ExposureVersion, exposure_version_id)
     if not ev or ev.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    vr = db.execute(select(ValidationResult).where(ValidationResult.upload_id == ev.upload_id, ValidationResult.tenant_id == user.tenant_id)).scalar_one_or_none()
+    vr = db.execute(
+        select(ValidationResult)
+        .where(ValidationResult.upload_id == ev.upload_id, ValidationResult.tenant_id == user.tenant_id)
+        .order_by(ValidationResult.created_at.desc())
+    ).scalar_one_or_none()
     if not vr:
         issues = []
     else:
-        issues = json.loads(get_object(vr.row_errors_uri.split(f"s3://{settings.minio_bucket}/",1)[1]).decode())
+        issues = json.loads(get_object(vr.row_errors_uri.split(f"s3://{settings.minio_bucket}/", 1)[1]).decode())
     quality_rows = db.execute(
         select(Location).where(
             Location.exposure_version_id == ev.id,
             Location.tenant_id == user.tenant_id,
-            Location.quality_tier == "C",
+            or_(
+                Location.quality_tier == "C",
+                and_(Location.geocode_confidence.isnot(None), Location.geocode_confidence < 0.6),
+            ),
         )
     ).scalars().all()
     items = []
     for loc in quality_rows:
         items.append({
-            "type": "QUALITY_TIER_C",
+            "type": "QUALITY_TIER_C" if (loc.quality_tier == "C") else "LOW_GEO_CONFIDENCE",
             "external_location_id": loc.external_location_id,
             "quality_tier": loc.quality_tier,
             "reasons": loc.quality_reasons_json or [],
@@ -314,6 +355,189 @@ def trigger_geocode(
     return {"run_id": run.id, "status": run.status}
 
 
+@router.post("/hazard-datasets")
+def create_hazard_dataset(
+    payload: HazardDatasetCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    dataset = HazardDataset(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        peril=payload.peril,
+        vendor=payload.vendor,
+        coverage_geo=payload.coverage_geo,
+        license_ref=payload.license_ref,
+    )
+    db.add(dataset)
+    db.commit()
+    return {"hazard_dataset_id": dataset.id}
+
+
+@router.get("/hazard-datasets")
+def list_hazard_datasets(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    items = db.execute(select(HazardDataset).where(HazardDataset.tenant_id == user.tenant_id)).scalars().all()
+    return {"items": [
+        {"id": d.id, "name": d.name, "peril": d.peril, "vendor": d.vendor, "created_at": d.created_at}
+        for d in items
+    ]}
+
+
+@router.post("/hazard-datasets/{hazard_dataset_id}/versions")
+def upload_hazard_dataset_version(
+    hazard_dataset_id: int,
+    version_label: str,
+    file: UploadFile = File(...),
+    effective_date: Optional[str] = None,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    dataset = db.get(HazardDataset, hazard_dataset_id)
+    if not dataset or dataset.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset not found")
+    raw = file.file.read()
+    checksum = compute_checksum(raw)
+    key = f"hazard_datasets/{user.tenant_id}/{hazard_dataset_id}/{version_label}.geojson"
+    uri = put_object(key, raw, content_type=file.content_type or "application/geo+json")
+    eff_dt = datetime.fromisoformat(effective_date) if effective_date else None
+    version = HazardDatasetVersion(
+        tenant_id=user.tenant_id,
+        hazard_dataset_id=hazard_dataset_id,
+        version_label=version_label,
+        storage_uri=uri,
+        checksum=checksum,
+        effective_date=eff_dt,
+    )
+    db.add(version)
+    db.commit()
+    geojson = json.loads(raw.decode())
+    features = geojson.get("features", [])
+    for feature in features:
+        geom_json = json.dumps(feature.get("geometry"))
+        geometry = func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326)
+        db.add(
+            HazardFeaturePolygon(
+                tenant_id=user.tenant_id,
+                hazard_dataset_version_id=version.id,
+                geom=geometry,
+                properties_json=feature.get("properties"),
+            )
+        )
+    db.commit()
+    return {"hazard_dataset_version_id": version.id}
+
+
+@router.get("/hazard-datasets/{hazard_dataset_id}/versions")
+def list_hazard_dataset_versions(hazard_dataset_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    versions = db.execute(
+        select(HazardDatasetVersion).where(
+            HazardDatasetVersion.hazard_dataset_id == hazard_dataset_id,
+            HazardDatasetVersion.tenant_id == user.tenant_id,
+        )
+    ).scalars().all()
+    return {"items": [
+        {"id": v.id, "version_label": v.version_label, "checksum": v.checksum, "created_at": v.created_at}
+        for v in versions
+    ]}
+
+
+@router.post("/hazard-overlays")
+def trigger_hazard_overlays(
+    payload: HazardOverlayRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, payload.exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    overlay_runs = []
+    for hdv_id in payload.hazard_dataset_version_ids:
+        version = db.get(HazardDatasetVersion, hdv_id)
+        if not version or version.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Dataset version not found")
+        run = Run(
+            tenant_id=user.tenant_id,
+            run_type=RunType.OVERLAY,
+            status=RunStatus.QUEUED,
+            input_refs_json={"exposure_version_id": payload.exposure_version_id, "hazard_dataset_version_id": hdv_id},
+            config_refs_json=payload.params or {},
+            created_by=user.user_id,
+            code_version=settings.code_version,
+        )
+        db.add(run)
+        db.commit()
+        overlay_task.delay(run.id, payload.exposure_version_id, hdv_id, user.tenant_id, payload.params or {})
+        overlay_runs.append({"run_id": run.id, "hazard_dataset_version_id": hdv_id})
+    return {"overlay_requests": overlay_runs}
+
+
+@router.get("/hazard-overlays/{overlay_result_id}/status")
+def get_overlay_status(overlay_result_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    overlay = db.get(HazardOverlayResult, overlay_result_id)
+    if not overlay or overlay.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, overlay.run_id) if overlay.run_id else None
+    return {
+        "hazard_overlay_result_id": overlay.id,
+        "run_status": run.status if run else None,
+        "created_at": overlay.created_at,
+    }
+
+
+@router.get("/hazard-overlays/{overlay_result_id}/summary")
+def overlay_summary(overlay_result_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    overlay = db.get(HazardOverlayResult, overlay_result_id)
+    if not overlay or overlay.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    total_locations = db.execute(
+        select(func.count()).select_from(Location).where(
+            Location.tenant_id == user.tenant_id,
+            Location.exposure_version_id == overlay.exposure_version_id,
+        )
+    ).scalar()
+    matched = db.execute(
+        select(func.count()).select_from(LocationHazardAttribute).where(
+            LocationHazardAttribute.tenant_id == user.tenant_id,
+            LocationHazardAttribute.hazard_overlay_result_id == overlay.id,
+        )
+    ).scalar()
+    band_counts = db.execute(
+        select(LocationHazardAttribute.attributes_json["band"], func.count())
+        .where(LocationHazardAttribute.hazard_overlay_result_id == overlay.id)
+        .group_by(LocationHazardAttribute.attributes_json["band"])
+    ).all()
+    return {
+        "overlay_result_id": overlay.id,
+        "locations": total_locations,
+        "matched": matched,
+        "band_distribution": {str(band): count for band, count in band_counts},
+    }
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: int, user: TokenData = Depends(require_role(
     UserRole.ADMIN.value,
@@ -325,7 +549,20 @@ def get_run(run_id: int, user: TokenData = Depends(require_role(
     run = db.get(Run, run_id)
     if not run or run.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return {"id": run.id, "status": run.status}
+    return {
+        "id": run.id,
+        "run_type": run.run_type,
+        "status": run.status,
+        "input_refs": run.input_refs_json,
+        "config_refs": run.config_refs_json,
+        "output_refs": run.output_refs_json,
+        "artifact_checksums": run.artifact_checksums_json,
+        "code_version": run.code_version,
+        "created_by": run.created_by,
+        "created_at": run.created_at,
+        "started_at": run.started_at,
+        "completed_at": run.completed_at,
+    }
 
 
 @router.get("/audit-events")
