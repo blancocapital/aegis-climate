@@ -47,13 +47,13 @@ export function OverlaysPage() {
           <option value="">Select version</option>
           {versions.data?.map((v) => (
             <option key={v.id} value={v.id}>
-              Version {v.id}
+              {v.version_label ? `${v.version_label} (#${v.id})` : `Version ${v.id}`}
             </option>
           ))}
         </Select>
       </div>
-      <Button onClick={startOverlay} disabled={!exposureId || !selectedVersion}>
-        Start overlay
+      <Button onClick={startOverlay} disabled={!exposureId || !selectedVersion || createOverlay.isLoading}>
+        {createOverlay.isLoading ? 'Starting...' : 'Start overlay'}
       </Button>
       {overlayId && (
         <div className="space-y-2 text-sm">

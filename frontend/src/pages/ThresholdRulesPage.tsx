@@ -7,13 +7,14 @@ import { ThresholdRule } from '../api/types'
 import { Input } from '../components/ui/input'
 import { Button } from '../components/ui/button'
 import { Textarea } from '../components/ui/textarea'
+import { toast } from 'sonner'
 
 export function ThresholdRulesPage() {
   const { data: rules = [], refetch } = useThresholdRules()
   const createRule = useCreateThresholdRule()
   const [name, setName] = useState('High loss')
   const [severity, setSeverity] = useState('CRITICAL')
-  const [ruleJson, setRuleJson] = useState('{"field": "tiv_sum", "op": ">", "value": 1000000}')
+  const [ruleJson, setRuleJson] = useState('{"metric": "tiv_sum", "operator": ">", "value": 1000000}')
 
   const columns: ColumnDef<ThresholdRule>[] = [
     { header: 'ID', accessorKey: 'id' },
@@ -22,7 +23,14 @@ export function ThresholdRulesPage() {
   ]
 
   const saveRule = async () => {
-    await createRule.mutateAsync({ name, severity, rule_json: JSON.parse(ruleJson) })
+    let parsed: any
+    try {
+      parsed = JSON.parse(ruleJson)
+    } catch (err) {
+      toast.error('Rule JSON is invalid')
+      return
+    }
+    await createRule.mutateAsync({ name, severity, rule_json: parsed })
     refetch()
   }
 
@@ -34,7 +42,9 @@ export function ThresholdRulesPage() {
         <Input value={severity} onChange={(e) => setSeverity(e.target.value)} placeholder="Severity" />
         <Textarea rows={3} value={ruleJson} onChange={(e) => setRuleJson(e.target.value)} />
       </div>
-      <Button onClick={saveRule}>Create rule</Button>
+      <Button onClick={saveRule} disabled={createRule.isLoading}>
+        {createRule.isLoading ? 'Creating...' : 'Create rule'}
+      </Button>
       <DataTable data={rules} columns={columns} />
     </Card>
   )

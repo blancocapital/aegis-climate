@@ -6,7 +6,6 @@ import { ColumnDef } from '@tanstack/react-table'
 import { ExposureVersion } from '../api/types'
 import { formatDate } from '../utils/date'
 import { formatNumber } from '../utils/format'
-import { Button } from '../components/ui/button'
 
 export function ExposureVersionsPage() {
   const { data = [], isLoading } = useExposureVersions()

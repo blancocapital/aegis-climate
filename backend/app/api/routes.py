@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
 
 import jwt
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Header
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status, Header
 from sqlalchemy import func, select, or_, and_
 from sqlalchemy.orm import Session
 
@@ -60,6 +60,27 @@ def emit_audit(session: Session, tenant_id: str, user_id: Optional[str], action:
     session.commit()
 
 
+def serialize_run(run: Run) -> Dict[str, Any]:
+    return {
+        "id": run.id,
+        "run_type": run.run_type.value if hasattr(run.run_type, "value") else run.run_type,
+        "status": run.status.value if hasattr(run.status, "value") else run.status,
+        "input_refs": run.input_refs_json,
+        "config_refs": run.config_refs_json,
+        "output_refs": run.output_refs_json,
+        "artifact_checksums": run.artifact_checksums_json,
+        "input_refs_json": run.input_refs_json,
+        "config_refs_json": run.config_refs_json,
+        "output_refs_json": run.output_refs_json,
+        "artifact_checksums_json": run.artifact_checksums_json,
+        "code_version": run.code_version,
+        "created_by": run.created_by,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+    }
+
+
 class MappingRequest(BaseModel):
     name: str = "default"
     mapping_json: Dict[str, str]
@@ -108,6 +129,10 @@ class ThresholdRuleCreate(BaseModel):
 class BreachEvalRequest(BaseModel):
     rollup_result_id: int
     threshold_rule_ids: Optional[List[int]] = None
+
+
+class CommitRequest(BaseModel):
+    name: Optional[str] = None
 
 
 @router.post("/auth/login")
@@ -231,9 +256,46 @@ def trigger_validate(
     return {"run_id": run.id, "status": run.status}
 
 
+@router.get("/validation-results/{validation_result_id}")
+def get_validation_result(
+    validation_result_id: int,
+    limit: int = 200,
+    offset: int = 0,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    vr = db.get(ValidationResult, validation_result_id)
+    if not vr or vr.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    issues: List[Dict[str, Any]] = []
+    if vr.row_errors_uri:
+        key = vr.row_errors_uri.split(f"s3://{settings.minio_bucket}/", 1)[1]
+        issues = json.loads(get_object(key).decode())
+    total = len(issues)
+    sliced = issues[offset : offset + limit] if limit else issues[offset:]
+    return {
+        "id": vr.id,
+        "summary": vr.summary_json,
+        "issues": sliced,
+        "total_issues": total,
+        "row_errors_uri": vr.row_errors_uri,
+        "checksum": vr.checksum,
+        "created_at": vr.created_at.isoformat(),
+        "mapping_template_id": vr.mapping_template_id,
+        "upload_id": vr.upload_id,
+    }
+
+
 @router.post("/uploads/{upload_id}/commit")
 def trigger_commit(
     upload_id: str,
+    payload: CommitRequest | None = Body(default=None),
     name: Optional[str] = None,
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
@@ -275,6 +337,7 @@ def trigger_commit(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Validation must match current mapping template",
         )
+    commit_name = payload.name if payload and payload.name else name
     run = Run(
         tenant_id=user.tenant_id,
         run_type=RunType.COMMIT,
@@ -286,7 +349,7 @@ def trigger_commit(
     )
     db.add(run)
     db.commit()
-    commit_task.delay(run.id, upload_id, user.tenant_id, name or f"Exposure {upload_id}")
+    commit_task.delay(run.id, upload_id, user.tenant_id, commit_name or f"Exposure {upload_id}")
     emit_audit(db, user.tenant_id, user.user_id, "commit_requested", {"upload_id": upload_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -299,11 +362,67 @@ def list_exposure_versions(user: TokenData = Depends(require_role(
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    rows = db.execute(select(ExposureVersion).where(ExposureVersion.tenant_id == user.tenant_id)).scalars().all()
+    rows = db.execute(
+        select(
+            ExposureVersion,
+            func.count(Location.id).label("location_count"),
+            func.sum(Location.tiv).label("tiv_sum"),
+        )
+        .outerjoin(
+            Location,
+            and_(
+                Location.exposure_version_id == ExposureVersion.id,
+                Location.tenant_id == user.tenant_id,
+            ),
+        )
+        .where(ExposureVersion.tenant_id == user.tenant_id)
+        .group_by(ExposureVersion.id)
+        .order_by(ExposureVersion.created_at.desc())
+    ).all()
     return {"items": [
-        {"id": ev.id, "name": ev.name, "upload_id": ev.upload_id, "created_at": ev.created_at.isoformat()}
-        for ev in rows
+        {
+            "id": ev.id,
+            "name": ev.name,
+            "upload_id": ev.upload_id,
+            "created_at": ev.created_at.isoformat(),
+            "location_count": location_count or 0,
+            "tiv_sum": float(tiv_sum or 0),
+        }
+        for ev, location_count, tiv_sum in rows
     ]}
+
+
+@router.get("/exposure-versions/{exposure_version_id}")
+def get_exposure_version(exposure_version_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    location_count = db.execute(
+        select(func.count(Location.id)).where(
+            Location.exposure_version_id == ev.id,
+            Location.tenant_id == user.tenant_id,
+        )
+    ).scalar_one()
+    tiv_sum = db.execute(
+        select(func.sum(Location.tiv)).where(
+            Location.exposure_version_id == ev.id,
+            Location.tenant_id == user.tenant_id,
+        )
+    ).scalar()
+    return {
+        "id": ev.id,
+        "name": ev.name,
+        "upload_id": ev.upload_id,
+        "created_at": ev.created_at.isoformat(),
+        "location_count": location_count or 0,
+        "tiv_sum": float(tiv_sum or 0),
+    }
 
 
 @router.get("/exposure-versions/{exposure_version_id}/summary")
@@ -339,9 +458,12 @@ def exposure_locations(exposure_version_id: int, user: TokenData = Depends(requi
             "external_location_id": r.external_location_id,
             "address_line1": r.address_line1,
             "city": r.city,
+            "state_region": r.state_region,
+            "postal_code": r.postal_code,
             "country": r.country,
             "latitude": r.latitude,
             "longitude": r.longitude,
+            "tiv": r.tiv,
         }
         for r in rows
     ]}
@@ -397,10 +519,22 @@ def trigger_geocode(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Geocoding is not implemented for Milestone A",
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.GEOCODE,
+        status=RunStatus.QUEUED,
+        input_refs_json={"exposure_version_id": exposure_version_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
     )
+    db.add(run)
+    db.commit()
+    geocode_task.delay(run.id, exposure_version_id, user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "geocode_requested", {"exposure_version_id": exposure_version_id})
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.post("/hazard-datasets")
@@ -409,10 +543,26 @@ def create_hazard_dataset(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard datasets are not implemented for Milestone A",
+    dataset = HazardDataset(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        peril=payload.peril,
+        vendor=payload.vendor,
+        coverage_geo=payload.coverage_geo,
+        license_ref=payload.license_ref,
     )
+    db.add(dataset)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "hazard_dataset_created", {"hazard_dataset_id": dataset.id})
+    return {
+        "id": dataset.id,
+        "name": dataset.name,
+        "peril": dataset.peril,
+        "vendor": dataset.vendor,
+        "coverage_geo": dataset.coverage_geo,
+        "license_ref": dataset.license_ref,
+        "created_at": dataset.created_at.isoformat(),
+    }
 
 
 @router.get("/hazard-datasets")
@@ -423,25 +573,83 @@ def list_hazard_datasets(user: TokenData = Depends(require_role(
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard datasets are not implemented for Milestone A",
-    )
+    rows = db.execute(
+        select(HazardDataset)
+        .where(HazardDataset.tenant_id == user.tenant_id)
+        .order_by(HazardDataset.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "name": r.name,
+            "peril": r.peril,
+            "vendor": r.vendor,
+            "coverage_geo": r.coverage_geo,
+            "license_ref": r.license_ref,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
 
 
 @router.post("/hazard-datasets/{hazard_dataset_id}/versions")
 def upload_hazard_dataset_version(
     hazard_dataset_id: int,
-    version_label: str,
+    version_label: Optional[str] = None,
     file: UploadFile = File(...),
     effective_date: Optional[str] = None,
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard datasets are not implemented for Milestone A",
+    dataset = db.get(HazardDataset, hazard_dataset_id)
+    if not dataset or dataset.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    payload = file.file.read()
+    checksum = compute_checksum(payload)
+    label = version_label or f"v{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    key = f"hazards/{user.tenant_id}/{hazard_dataset_id}/{label}/{file.filename}"
+    uri = put_object(key, payload, content_type=file.content_type or "application/json")
+    eff = datetime.fromisoformat(effective_date) if effective_date else None
+    version = HazardDatasetVersion(
+        tenant_id=user.tenant_id,
+        hazard_dataset_id=hazard_dataset_id,
+        version_label=label,
+        storage_uri=uri,
+        checksum=checksum,
+        effective_date=eff,
     )
+    db.add(version)
+    db.commit()
+    try:
+        geojson = json.loads(payload.decode())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid GeoJSON") from exc
+    features = geojson.get("features") or []
+    rows = []
+    for feature in features:
+        geom = feature.get("geometry")
+        if not geom:
+            continue
+        geom_json = json.dumps(geom)
+        rows.append(
+            HazardFeaturePolygon(
+                tenant_id=user.tenant_id,
+                hazard_dataset_version_id=version.id,
+                geom=func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326),
+                properties_json=feature.get("properties") or {},
+            )
+        )
+    if rows:
+        db.add_all(rows)
+        db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "hazard_dataset_version_created", {"hazard_dataset_version_id": version.id})
+    return {
+        "id": version.id,
+        "version_label": version.version_label,
+        "checksum": version.checksum,
+        "created_at": version.created_at.isoformat(),
+        "effective_date": version.effective_date.isoformat() if version.effective_date else None,
+    }
 
 
 @router.get("/hazard-datasets/{hazard_dataset_id}/versions")
@@ -452,10 +660,27 @@ def list_hazard_dataset_versions(hazard_dataset_id: int, user: TokenData = Depen
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard datasets are not implemented for Milestone A",
-    )
+    dataset = db.get(HazardDataset, hazard_dataset_id)
+    if not dataset or dataset.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    rows = db.execute(
+        select(HazardDatasetVersion)
+        .where(
+            HazardDatasetVersion.tenant_id == user.tenant_id,
+            HazardDatasetVersion.hazard_dataset_id == hazard_dataset_id,
+        )
+        .order_by(HazardDatasetVersion.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "version_label": r.version_label,
+            "checksum": r.checksum,
+            "created_at": r.created_at.isoformat(),
+            "effective_date": r.effective_date.isoformat() if r.effective_date else None,
+        }
+        for r in rows
+    ]}
 
 
 @router.post("/hazard-overlays")
@@ -464,10 +689,39 @@ def trigger_hazard_overlays(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard overlays are not implemented for Milestone A",
+    if not payload.hazard_dataset_version_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="hazard_dataset_version_ids required")
+    ev = db.get(ExposureVersion, payload.exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    hazard_dataset_version_id = payload.hazard_dataset_version_ids[0]
+    hdv = db.get(HazardDatasetVersion, hazard_dataset_version_id)
+    if not hdv or hdv.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hazard dataset version not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.OVERLAY,
+        status=RunStatus.QUEUED,
+        input_refs_json={"exposure_version_id": payload.exposure_version_id, "hazard_dataset_version_id": hazard_dataset_version_id},
+        config_refs_json={"params": payload.params or {}},
+        created_by=user.user_id,
+        code_version=settings.code_version,
     )
+    db.add(run)
+    db.commit()
+    overlay = HazardOverlayResult(
+        tenant_id=user.tenant_id,
+        exposure_version_id=payload.exposure_version_id,
+        hazard_dataset_version_id=hazard_dataset_version_id,
+        method="POSTGIS_SPATIAL_JOIN",
+        params_json=payload.params or {},
+        run_id=run.id,
+    )
+    db.add(overlay)
+    db.commit()
+    overlay_task.delay(run.id, overlay.id, payload.exposure_version_id, hazard_dataset_version_id, user.tenant_id, payload.params)
+    emit_audit(db, user.tenant_id, user.user_id, "overlay_requested", {"overlay_result_id": overlay.id})
+    return {"overlay_result_id": overlay.id, "run_id": run.id}
 
 
 @router.get("/hazard-overlays/{overlay_result_id}/status")
@@ -478,10 +732,12 @@ def get_overlay_status(overlay_result_id: int, user: TokenData = Depends(require
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard overlays are not implemented for Milestone A",
-    )
+    overlay = db.get(HazardOverlayResult, overlay_result_id)
+    if not overlay or overlay.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, overlay.run_id) if overlay.run_id else None
+    status_value = run.status.value if run and hasattr(run.status, "value") else (run.status if run else "PENDING")
+    return {"overlay_result_id": overlay.id, "status": status_value, "run_id": overlay.run_id}
 
 
 @router.get("/hazard-overlays/{overlay_result_id}/summary")
@@ -492,10 +748,17 @@ def overlay_summary(overlay_result_id: int, user: TokenData = Depends(require_ro
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Hazard overlays are not implemented for Milestone A",
-    )
+    overlay = db.get(HazardOverlayResult, overlay_result_id)
+    if not overlay or overlay.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, overlay.run_id) if overlay.run_id else None
+    summary = None
+    if run and run.output_refs_json:
+        summary = run.output_refs_json.get("summary")
+    return {
+        "overlay_result_id": overlay.id,
+        "summary": summary,
+    }
 
 
 @router.post("/drift")
@@ -504,10 +767,36 @@ def trigger_drift(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Drift is not implemented for Milestone A",
+    ev_a = db.get(ExposureVersion, payload.exposure_version_a)
+    ev_b = db.get(ExposureVersion, payload.exposure_version_b)
+    if not ev_a or not ev_b or ev_a.tenant_id != user.tenant_id or ev_b.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.DRIFT,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "exposure_version_a": payload.exposure_version_a,
+            "exposure_version_b": payload.exposure_version_b,
+        },
+        config_refs_json={"config": payload.config or {}},
+        created_by=user.user_id,
+        code_version=settings.code_version,
     )
+    db.add(run)
+    db.commit()
+    drift_run = DriftRun(
+        tenant_id=user.tenant_id,
+        exposure_version_a_id=payload.exposure_version_a,
+        exposure_version_b_id=payload.exposure_version_b,
+        config_json=payload.config or {},
+        run_id=run.id,
+    )
+    db.add(drift_run)
+    db.commit()
+    drift_task.delay(run.id, drift_run.id, payload.exposure_version_a, payload.exposure_version_b, user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "drift_requested", {"drift_run_id": drift_run.id})
+    return {"run_id": run.id, "drift_run_id": drift_run.id, "status": run.status}
 
 
 @router.get("/drift/{drift_run_id}")
@@ -522,10 +811,32 @@ def get_drift(
     )),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Drift is not implemented for Milestone A",
-    )
+    drift_run = db.get(DriftRun, drift_run_id)
+    if not drift_run or drift_run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, drift_run.run_id) if drift_run.run_id else None
+    summary = None
+    if run and run.output_refs_json:
+        summary = run.output_refs_json.get("summary")
+    if not summary:
+        counts = db.execute(
+            select(DriftDetail.classification, func.count(DriftDetail.id))
+            .where(DriftDetail.drift_run_id == drift_run_id, DriftDetail.tenant_id == user.tenant_id)
+            .group_by(DriftDetail.classification)
+        ).all()
+        summary = {row[0]: row[1] for row in counts}
+        summary["total"] = sum(summary.values()) if summary else 0
+    return {
+        "drift_run_id": drift_run.id,
+        "exposure_version_a": drift_run.exposure_version_a_id,
+        "exposure_version_b": drift_run.exposure_version_b_id,
+        "summary": summary,
+        "status": run.status.value if run and hasattr(run.status, "value") else (run.status if run else "PENDING"),
+        "created_at": drift_run.created_at.isoformat(),
+        "run_id": drift_run.run_id,
+        "storage_uri": drift_run.storage_uri,
+        "checksum": drift_run.checksum,
+    }
 
 
 @router.get("/drift/{drift_run_id}/details")
@@ -543,10 +854,30 @@ def drift_details(
     )),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Drift is not implemented for Milestone A",
+    drift_run = db.get(DriftRun, drift_run_id)
+    if not drift_run or drift_run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    query = select(DriftDetail).where(
+        DriftDetail.drift_run_id == drift_run_id,
+        DriftDetail.tenant_id == user.tenant_id,
     )
+    if classification:
+        query = query.where(DriftDetail.classification == classification)
+    total = db.execute(
+        select(func.count()).select_from(query.subquery())
+    ).scalar_one()
+    rows = db.execute(query.order_by(DriftDetail.id.asc()).limit(limit).offset(offset)).scalars().all()
+    return {
+        "items": [
+            {
+                "external_location_id": r.external_location_id,
+                "classification": r.classification,
+                "delta_json": r.delta_json,
+            }
+            for r in rows
+        ],
+        "total": total,
+    }
 
 
 @router.post("/rollup-configs")
@@ -555,10 +886,33 @@ def create_rollup_config(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rollups are not implemented for Milestone A",
+    current_version = db.execute(
+        select(func.max(RollupConfig.version)).where(
+            RollupConfig.tenant_id == user.tenant_id,
+            RollupConfig.name == payload.name,
+        )
+    ).scalar()
+    cfg = RollupConfig(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        version=(current_version or 0) + 1,
+        dimensions_json=payload.dimensions_json,
+        filters_json=payload.filters_json,
+        measures_json=payload.measures_json,
+        created_by=user.user_id,
     )
+    db.add(cfg)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "rollup_config_created", {"rollup_config_id": cfg.id})
+    return {
+        "id": cfg.id,
+        "name": cfg.name,
+        "version": cfg.version,
+        "dimensions_json": cfg.dimensions_json,
+        "filters_json": cfg.filters_json,
+        "measures_json": cfg.measures_json,
+        "created_at": cfg.created_at.isoformat(),
+    }
 
 
 @router.get("/rollup-configs")
@@ -569,10 +923,23 @@ def list_rollup_configs(user: TokenData = Depends(require_role(
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rollups are not implemented for Milestone A",
-    )
+    rows = db.execute(
+        select(RollupConfig)
+        .where(RollupConfig.tenant_id == user.tenant_id)
+        .order_by(RollupConfig.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "name": r.name,
+            "version": r.version,
+            "dimensions_json": r.dimensions_json,
+            "filters_json": r.filters_json,
+            "measures_json": r.measures_json,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
 
 
 @router.post("/rollups")
@@ -581,10 +948,45 @@ def trigger_rollup(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rollups are not implemented for Milestone A",
+    ev = db.get(ExposureVersion, payload.exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    cfg = db.get(RollupConfig, payload.rollup_config_id)
+    if not cfg or cfg.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup config not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.ROLLUP,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "exposure_version_id": payload.exposure_version_id,
+            "hazard_overlay_result_ids": payload.hazard_overlay_result_ids,
+        },
+        config_refs_json={"rollup_config_id": payload.rollup_config_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
     )
+    db.add(run)
+    db.commit()
+    rollup_result = RollupResult(
+        tenant_id=user.tenant_id,
+        exposure_version_id=payload.exposure_version_id,
+        rollup_config_id=payload.rollup_config_id,
+        hazard_overlay_result_ids_json=payload.hazard_overlay_result_ids,
+        run_id=run.id,
+    )
+    db.add(rollup_result)
+    db.commit()
+    rollup_task.delay(
+        run.id,
+        rollup_result.id,
+        payload.exposure_version_id,
+        payload.rollup_config_id,
+        payload.hazard_overlay_result_ids,
+        user.tenant_id,
+    )
+    emit_audit(db, user.tenant_id, user.user_id, "rollup_requested", {"rollup_result_id": rollup_result.id})
+    return {"id": rollup_result.id, "run_id": run.id}
 
 
 @router.get("/rollups/{rollup_result_id}")
@@ -595,10 +997,25 @@ def rollup_result_detail(rollup_result_id: int, user: TokenData = Depends(requir
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rollups are not implemented for Milestone A",
-    )
+    rr = db.get(RollupResult, rollup_result_id)
+    if not rr or rr.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    items = db.execute(
+        select(RollupResultItem)
+        .where(
+            RollupResultItem.tenant_id == user.tenant_id,
+            RollupResultItem.rollup_result_id == rollup_result_id,
+        )
+        .order_by(RollupResultItem.id.asc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "rollup_key": json.dumps(item.rollup_key_json, sort_keys=True),
+            "rollup_key_json": item.rollup_key_json,
+            "metrics": item.metrics_json,
+        }
+        for item in items
+    ]}
 
 
 @router.get("/rollups/{rollup_result_id}/drilldown")
@@ -614,10 +1031,39 @@ def rollup_drilldown(
     )),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Rollups are not implemented for Milestone A",
+    rr = db.get(RollupResult, rollup_result_id)
+    if not rr or rr.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    try:
+        padded = rollup_key_b64 + "=" * (-len(rollup_key_b64) % 4)
+        key_json = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid rollup key") from exc
+    query = select(Location).where(
+        Location.tenant_id == user.tenant_id,
+        Location.exposure_version_id == rr.exposure_version_id,
     )
+    for field, value in (key_json or {}).items():
+        if hasattr(Location, field):
+            query = query.where(getattr(Location, field) == value)
+    rows = db.execute(query).scalars().all()
+    return {"items": [
+        {
+            "external_location_id": r.external_location_id,
+            "address_line1": r.address_line1,
+            "city": r.city,
+            "state_region": r.state_region,
+            "postal_code": r.postal_code,
+            "country": r.country,
+            "latitude": r.latitude,
+            "longitude": r.longitude,
+            "tiv": r.tiv,
+            "lob": r.lob,
+            "product_code": r.product_code,
+            "quality_tier": r.quality_tier,
+        }
+        for r in rows
+    ]}
 
 @router.post("/threshold-rules")
 def create_threshold_rule(
@@ -625,10 +1071,25 @@ def create_threshold_rule(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Threshold rules are not implemented for Milestone A",
+    rule = ThresholdRule(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        rule_json=payload.rule_json,
+        severity=payload.severity,
+        active=payload.active,
+        created_by=user.user_id,
     )
+    db.add(rule)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "threshold_rule_created", {"threshold_rule_id": rule.id})
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "severity": rule.severity,
+        "active": rule.active,
+        "rule_json": rule.rule_json,
+        "created_at": rule.created_at.isoformat(),
+    }
 
 
 @router.get("/threshold-rules")
@@ -639,10 +1100,22 @@ def list_threshold_rules(user: TokenData = Depends(require_role(
     UserRole.AUDITOR.value,
     UserRole.READ_ONLY.value,
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Threshold rules are not implemented for Milestone A",
-    )
+    rows = db.execute(
+        select(ThresholdRule)
+        .where(ThresholdRule.tenant_id == user.tenant_id)
+        .order_by(ThresholdRule.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "name": r.name,
+            "severity": r.severity,
+            "active": r.active,
+            "rule_json": r.rule_json,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
 
 
 @router.post("/breaches/run")
@@ -651,10 +1124,23 @@ def run_breach_eval(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Breaches are not implemented for Milestone A",
+    rr = db.get(RollupResult, payload.rollup_result_id)
+    if not rr or rr.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup result not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.BREACH_EVAL,
+        status=RunStatus.QUEUED,
+        input_refs_json={"rollup_result_id": payload.rollup_result_id},
+        config_refs_json={"threshold_rule_ids": payload.threshold_rule_ids or []},
+        created_by=user.user_id,
+        code_version=settings.code_version,
     )
+    db.add(run)
+    db.commit()
+    breach_task.delay(run.id, payload.rollup_result_id, payload.threshold_rule_ids, user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "breach_eval_requested", {"rollup_result_id": payload.rollup_result_id})
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.get("/breaches")
@@ -671,10 +1157,35 @@ def list_breaches(
     )),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Breaches are not implemented for Milestone A",
+    query = (
+        select(Breach, ThresholdRule.name.label("rule_name"))
+        .join(ThresholdRule, ThresholdRule.id == Breach.threshold_rule_id)
+        .where(Breach.tenant_id == user.tenant_id)
     )
+    if status_filter:
+        query = query.where(Breach.status == status_filter)
+    if exposure_version_id:
+        query = query.where(Breach.exposure_version_id == exposure_version_id)
+    if threshold_rule_id:
+        query = query.where(Breach.threshold_rule_id == threshold_rule_id)
+    rows = db.execute(query.order_by(Breach.last_seen_at.desc())).all()
+    return {"items": [
+        {
+            "id": breach.id,
+            "status": breach.status,
+            "rule_id": breach.threshold_rule_id,
+            "rule_name": rule_name,
+            "exposure_version_id": breach.exposure_version_id,
+            "rollup_result_id": breach.rollup_result_id,
+            "rollup_key": json.dumps(breach.rollup_key_json, sort_keys=True),
+            "metric_name": breach.metric_name,
+            "metric_value": breach.metric_value,
+            "threshold_value": breach.threshold_value,
+            "first_seen_at": breach.first_seen_at.isoformat(),
+            "last_seen_at": breach.last_seen_at.isoformat(),
+        }
+        for breach, rule_name in rows
+    ]}
 
 
 @router.patch("/breaches/{breach_id}")
@@ -684,10 +1195,23 @@ def update_breach_status(
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Breaches are not implemented for Milestone A",
-    )
+    breach = db.get(Breach, breach_id)
+    if not breach or breach.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    status_value = payload.get("status")
+    if status_value not in {"OPEN", "ACKED", "RESOLVED"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
+    breach.status = status_value
+    breach.last_seen_at = datetime.utcnow()
+    if status_value == "RESOLVED":
+        breach.resolved_at = datetime.utcnow()
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "breach_status_updated", {"breach_id": breach.id, "status": status_value})
+    return {
+        "id": breach.id,
+        "status": breach.status,
+        "resolved_at": breach.resolved_at.isoformat() if breach.resolved_at else None,
+    }
 
 
 @router.get("/lineage")
@@ -703,10 +1227,45 @@ def get_lineage(
     )),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail="Lineage is not implemented for Milestone A",
-    )
+    lineage = build_lineage(db, user.tenant_id, entity_type, entity_id)
+    if not lineage:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return lineage
+
+
+@router.get("/runs")
+def list_runs(
+    status_filter: Optional[str] = None,
+    run_type: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = select(Run).where(Run.tenant_id == user.tenant_id)
+    if status_filter:
+        try:
+            status_enum = RunStatus(status_filter)
+            query = query.where(Run.status == status_enum)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status") from exc
+    if run_type:
+        try:
+            run_type_enum = RunType(run_type)
+            query = query.where(Run.run_type == run_type_enum)
+        except ValueError as exc:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid run_type") from exc
+    total = db.execute(select(func.count()).select_from(query.subquery())).scalar_one()
+    rows = db.execute(
+        query.order_by(Run.created_at.desc()).limit(limit).offset(offset)
+    ).scalars().all()
+    return {"items": [serialize_run(r) for r in rows], "total": total}
 
 
 @router.get("/runs/{run_id}")
@@ -720,20 +1279,7 @@ def get_run(run_id: int, user: TokenData = Depends(require_role(
     run = db.get(Run, run_id)
     if not run or run.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
-    return {
-        "id": run.id,
-        "run_type": run.run_type,
-        "status": run.status,
-        "input_refs": run.input_refs_json,
-        "config_refs": run.config_refs_json,
-        "output_refs": run.output_refs_json,
-        "artifact_checksums": run.artifact_checksums_json,
-        "code_version": run.code_version,
-        "created_by": run.created_by,
-        "created_at": run.created_at,
-        "started_at": run.started_at,
-        "completed_at": run.completed_at,
-    }
+    return serialize_run(run)
 
 
 @router.get("/audit-events")

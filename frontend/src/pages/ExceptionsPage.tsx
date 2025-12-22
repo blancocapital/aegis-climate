@@ -11,11 +11,30 @@ export function ExceptionsPage() {
   const [selected, setSelected] = useState<string>('')
   const { data: exceptions = [], isLoading } = useExposureExceptions(selected)
 
-  const columns: ColumnDef<any>[] = [
+  const rows = exceptions.map((ex) => {
+    const details = [
+      ex.row_number ? `Row ${ex.row_number}` : null,
+      ex.field ? `Field ${ex.field}` : null,
+      ex.geocode_confidence !== undefined ? `Geo conf ${ex.geocode_confidence}` : null,
+      ex.reasons && ex.reasons.length ? `Reasons: ${ex.reasons.join(', ')}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ')
+    return {
+      type: ex.type,
+      external_location_id: ex.external_location_id,
+      severity: ex.severity || (ex.type === 'VALIDATION_ISSUE' ? 'ERROR' : undefined),
+      message: ex.message || ex.code || (ex.quality_tier ? `Quality tier ${ex.quality_tier}` : undefined),
+      details: details || '-',
+    }
+  })
+
+  const columns: ColumnDef<(typeof rows)[number]>[] = [
     { header: 'Type', accessorKey: 'type', cell: ({ getValue }) => <Badge>{String(getValue())}</Badge> },
+    { header: 'External ID', accessorKey: 'external_location_id' },
     { header: 'Severity', accessorKey: 'severity' },
     { header: 'Message', accessorKey: 'message' },
-    { header: 'External ID', accessorKey: 'external_location_id' },
+    { header: 'Details', accessorKey: 'details' },
   ]
 
   return (
@@ -37,8 +56,8 @@ export function ExceptionsPage() {
       {selected ? (
         isLoading ? (
           <p>Loading...</p>
-        ) : exceptions.length ? (
-          <DataTable data={exceptions} columns={columns} />
+        ) : rows.length ? (
+          <DataTable data={rows} columns={columns} />
         ) : (
           <p className="text-sm text-slate-600">No exceptions for this version.</p>
         )

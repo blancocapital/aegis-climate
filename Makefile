@@ -1,4 +1,4 @@
-.PHONY: dev backend frontend migrate seed install install-backend install-frontend
+.PHONY: dev backend frontend migrate seed install install-backend install-frontend qa
 
 install: install-backend install-frontend
 
@@ -18,10 +18,34 @@ frontend:
 	cd frontend && npm install && npm run dev -- --host 0.0.0.0
 
 migrate:
-	cd backend && alembic upgrade head
+	@if docker compose -f infra/docker-compose.yml ps -q api > /dev/null 2>&1; then \
+		docker compose -f infra/docker-compose.yml exec -T api alembic upgrade head; \
+	else \
+		cd backend && alembic upgrade head; \
+	fi
 
 seed:
-	cd backend && python -m seed
+	@if docker compose -f infra/docker-compose.yml ps -q api > /dev/null 2>&1; then \
+		docker compose -f infra/docker-compose.yml exec -T api python -m seed; \
+	else \
+		cd backend && python -m seed; \
+	fi
 
 test:
 	cd backend && pytest
+
+qa:
+	docker compose -f infra/docker-compose.yml up -d --build
+	@echo "Waiting for services..."
+	@for i in $$(seq 1 60); do \
+		if curl -sf http://localhost:8000/health > /dev/null && curl -sf http://localhost:5173 > /dev/null; then \
+			echo "Services are ready."; \
+			break; \
+		fi; \
+		sleep 2; \
+	done
+	$(MAKE) migrate
+	$(MAKE) seed
+	cd frontend && npm install
+	cd frontend && npm run build
+	cd frontend && npm run test:e2e

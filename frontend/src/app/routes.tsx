@@ -14,6 +14,7 @@ import { BreachesPage } from '../pages/BreachesPage'
 import { RunsPage } from '../pages/RunsPage'
 import { AuditLogPage } from '../pages/AuditLogPage'
 import { AuthProvider } from '../auth/AuthProvider'
+import { NotFoundPage } from '../pages/NotFoundPage'
 
 export const router = createBrowserRouter([
   {
@@ -25,6 +26,7 @@ export const router = createBrowserRouter([
     ),
     children: [
       { path: 'login', element: <LoginPage /> },
+      { path: '*', element: <NotFoundPage /> },
       {
         element: (
           <RequireAuth>

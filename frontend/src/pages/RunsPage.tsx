@@ -28,7 +28,18 @@ export function RunsPage() {
       </Card>
       <Card className="space-y-2">
         <div className="flex items-center gap-2">
-          <Input placeholder="Run ID" onChange={(e) => setRunId(Number(e.target.value))} />
+          <Input
+            placeholder="Run ID"
+            onChange={(e) => {
+              const value = e.target.value.trim()
+              if (!value) {
+                setRunId(null)
+                return
+              }
+              const parsed = Number(value)
+              setRunId(Number.isNaN(parsed) ? null : parsed)
+            }}
+          />
         </div>
         {runQuery.data ? (
           <pre className="rounded bg-slate-900 p-3 text-xs text-slate-100">{JSON.stringify(runQuery.data, null, 2)}</pre>

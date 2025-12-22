@@ -10,8 +10,16 @@ export function AuditLogPage() {
   const { data = [] } = useAuditEvents()
 
   const columns: ColumnDef<AuditEvent>[] = [
-    { header: 'ID', accessorKey: 'id' },
     { header: 'Action', accessorKey: 'action', cell: ({ getValue }) => <Badge>{String(getValue())}</Badge> },
+    { header: 'User', accessorKey: 'user_id' },
+    {
+      header: 'Metadata',
+      accessorKey: 'metadata',
+      cell: ({ getValue }) => {
+        const value = getValue() as Record<string, any> | undefined
+        return value ? JSON.stringify(value) : '-'
+      },
+    },
     { header: 'Created', accessorKey: 'created_at', cell: ({ getValue }) => formatDate(getValue() as string) },
   ]
 

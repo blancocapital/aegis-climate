@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useBreaches, useRunBreachEval, useThresholdRules, useUpdateBreachStatus, useRollup, useExposureVersions } from '../api/hooks'
+import { useBreaches, useRunBreachEval, useThresholdRules, useUpdateBreachStatus, useExposureVersions } from '../api/hooks'
 import { Card } from '../components/ui/card'
 import { Select } from '../components/ui/select'
 import { Button } from '../components/ui/button'
@@ -8,13 +8,15 @@ import { ColumnDef } from '@tanstack/react-table'
 import { Breach } from '../api/types'
 import { formatDate } from '../utils/date'
 import { Badge } from '../components/ui/badge'
+import { Input } from '../components/ui/input'
 
 export function BreachesPage() {
   const { data: rules = [] } = useThresholdRules()
   const { data: exposures = [] } = useExposureVersions()
   const [ruleId, setRuleId] = useState<number | null>(null)
   const [exposureId, setExposureId] = useState<number | null>(null)
-  const { data: breaches = [], refetch } = useBreaches({ exposure_version_id: exposureId, rule_id: ruleId })
+  const [rollupResultId, setRollupResultId] = useState<number | null>(null)
+  const { data: breaches = [], refetch } = useBreaches({ exposure_version_id: exposureId, threshold_rule_id: ruleId })
   const update = useUpdateBreachStatus()
   const runEval = useRunBreachEval()
 
@@ -23,6 +25,9 @@ export function BreachesPage() {
     { header: 'Status', accessorKey: 'status', cell: ({ getValue }) => <Badge>{String(getValue())}</Badge> },
     { header: 'Rule', accessorKey: 'rule_name' },
     { header: 'Rollup Key', accessorKey: 'rollup_key' },
+    { header: 'Metric', accessorKey: 'metric_name' },
+    { header: 'Value', accessorKey: 'metric_value' },
+    { header: 'Threshold', accessorKey: 'threshold_value' },
     { header: 'Last Seen', accessorKey: 'last_seen_at', cell: ({ getValue }) => formatDate(getValue() as string) },
     {
       header: 'Actions',
@@ -45,8 +50,8 @@ export function BreachesPage() {
   }
 
   const triggerEval = async () => {
-    if (!ruleId) return
-    await runEval.mutateAsync({ rollup_result_id: 1, threshold_rule_ids: [ruleId] })
+    if (!ruleId || !rollupResultId) return
+    await runEval.mutateAsync({ rollup_result_id: rollupResultId, threshold_rule_ids: [ruleId] })
     refetch()
   }
 
@@ -70,7 +75,14 @@ export function BreachesPage() {
             </option>
           ))}
         </Select>
-        <Button onClick={triggerEval}>Run evaluation</Button>
+        <Input
+          placeholder="Rollup result ID"
+          value={rollupResultId?.toString() || ''}
+          onChange={(e) => setRollupResultId(e.target.value ? Number(e.target.value) : null)}
+        />
+        <Button onClick={triggerEval} disabled={!ruleId || !rollupResultId || runEval.isLoading}>
+          {runEval.isLoading ? 'Running...' : 'Run evaluation'}
+        </Button>
       </div>
       <DataTable data={breaches} columns={columns} />
     </Card>

@@ -1,5 +1,6 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { apiRequest } from './client'
+import { normalizeListResponse } from './normalize'
 import {
   AuditEventSchema,
   BreachSchema,
@@ -17,6 +18,7 @@ import {
   RunSchema,
   ThresholdRuleSchema,
   UploadResponseSchema,
+  ValidationResultSchema,
 } from './types'
 
 const pollingStatuses = ['QUEUED', 'RUNNING']
@@ -74,20 +76,35 @@ export function useRun(runId?: number, enabled = true) {
       data && pollingStatuses.includes((data as any).status)
         ? 1500
         : false,
+    refetchIntervalInBackground: true,
   })
 }
 
-export function useRuns(params?: { status?: string }) {
+export function useValidationResult(id?: number, params?: { limit?: number; offset?: number }) {
+  return useQuery({
+    queryKey: ['validation-result', id, params],
+    queryFn: () => apiRequest({ path: `/validation-results/${id}`, params }).then((res) => ValidationResultSchema.parse(res)),
+    enabled: Boolean(id),
+  })
+}
+
+export function useRuns(params?: { status_filter?: string; run_type?: string }) {
   return useQuery({
     queryKey: ['runs', params],
-    queryFn: () => apiRequest({ path: '/runs', params }).then((res) => RunSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/runs', params }).then((res) =>
+        RunSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
 export function useExposureVersions() {
   return useQuery({
     queryKey: ['exposure-versions'],
-    queryFn: () => apiRequest({ path: '/exposure-versions' }).then((res) => ExposureVersionSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/exposure-versions' }).then((res) =>
+        ExposureVersionSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
@@ -102,7 +119,10 @@ export function useExposureVersion(id?: string | number) {
 export function useExposureLocations(id?: string | number, params?: Record<string, any>) {
   return useQuery({
     queryKey: ['exposure-locations', id, params],
-    queryFn: () => apiRequest({ path: `/exposure-versions/${id}/locations`, params }).then((res) => ExposureLocationSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: `/exposure-versions/${id}/locations`, params }).then((res) =>
+        ExposureLocationSchema.array().parse(normalizeListResponse(res))
+      ),
     enabled: Boolean(id),
   })
 }
@@ -110,7 +130,10 @@ export function useExposureLocations(id?: string | number, params?: Record<strin
 export function useExposureExceptions(id?: string | number) {
   return useQuery({
     queryKey: ['exposure-exceptions', id],
-    queryFn: () => apiRequest({ path: `/exposure-versions/${id}/exceptions` }).then((res) => ExceptionSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: `/exposure-versions/${id}/exceptions` }).then((res) =>
+        ExceptionSchema.array().parse(normalizeListResponse(res))
+      ),
     enabled: Boolean(id),
   })
 }
@@ -118,30 +141,38 @@ export function useExposureExceptions(id?: string | number) {
 export function useHazardDatasets() {
   return useQuery({
     queryKey: ['hazard-datasets'],
-    queryFn: () => apiRequest({ path: '/hazard-datasets' }).then((res) => HazardDatasetSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/hazard-datasets' }).then((res) =>
+        HazardDatasetSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
 export function useHazardDatasetVersions(id?: number) {
   return useQuery({
     queryKey: ['hazard-dataset-versions', id],
-    queryFn: () => apiRequest({ path: `/hazard-datasets/${id}/versions` }).then((res) => HazardDatasetVersionSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: `/hazard-datasets/${id}/versions` }).then((res) =>
+        HazardDatasetVersionSchema.array().parse(normalizeListResponse(res))
+      ),
     enabled: Boolean(id),
   })
 }
 
 export function useCreateHazardDataset() {
   return useMutation({
-    mutationFn: (payload: { name: string; description?: string }) =>
+    mutationFn: (payload: { name: string; peril: string; vendor?: string; coverage_geo?: string; license_ref?: string }) =>
       apiRequest({ method: 'POST', path: '/hazard-datasets', body: payload }).then((res) => HazardDatasetSchema.parse(res)),
   })
 }
 
 export function useUploadHazardVersion(datasetId?: number) {
   return useMutation({
-    mutationFn: (payload: { file: File }) => {
+    mutationFn: (payload: { file: File; version_label?: string; effective_date?: string }) => {
       const data = new FormData()
       data.append('file', payload.file)
+      if (payload.version_label) data.append('version_label', payload.version_label)
+      if (payload.effective_date) data.append('effective_date', payload.effective_date)
       return apiRequest({
         method: 'POST',
         path: `/hazard-datasets/${datasetId}/versions`,
@@ -168,6 +199,7 @@ export function useOverlayStatus(id?: number) {
       data && pollingStatuses.includes((data as any).status)
         ? 1500
         : false,
+    refetchIntervalInBackground: true,
   })
 }
 
@@ -182,20 +214,23 @@ export function useOverlaySummary(id?: number) {
 export function useRollupConfigs() {
   return useQuery({
     queryKey: ['rollup-configs'],
-    queryFn: () => apiRequest({ path: '/rollup-configs' }).then((res) => RollupConfigSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/rollup-configs' }).then((res) =>
+        RollupConfigSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
 export function useCreateRollupConfig() {
   return useMutation({
-    mutationFn: (payload: { name: string; config_json: any }) =>
+    mutationFn: (payload: { name: string; dimensions_json: string[]; measures_json: Record<string, any>[]; filters_json?: Record<string, any> }) =>
       apiRequest({ method: 'POST', path: '/rollup-configs', body: payload }).then((res) => RollupConfigSchema.parse(res)),
   })
 }
 
 export function useCreateRollup() {
   return useMutation({
-    mutationFn: (payload: { exposure_version_id: number; rollup_config_id: number; overlay_result_ids?: number[] }) =>
+    mutationFn: (payload: { exposure_version_id: number; rollup_config_id: number; hazard_overlay_result_ids?: number[] }) =>
       apiRequest({ method: 'POST', path: '/rollups', body: payload }).then((res) => ({ rollup_result_id: res.id, run_id: res.run_id })),
   })
 }
@@ -203,7 +238,10 @@ export function useCreateRollup() {
 export function useRollup(id?: number) {
   return useQuery({
     queryKey: ['rollup', id],
-    queryFn: () => apiRequest({ path: `/rollups/${id}` }).then((res) => RollupRowSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: `/rollups/${id}` }).then((res) =>
+        RollupRowSchema.array().parse(normalizeListResponse(res))
+      ),
     enabled: Boolean(id),
   })
 }
@@ -211,7 +249,7 @@ export function useRollup(id?: number) {
 export function useRollupDrilldown(id?: number, key?: string) {
   return useQuery({
     queryKey: ['rollup-drilldown', id, key],
-    queryFn: () => apiRequest({ path: `/rollups/${id}/drilldown`, params: { rollup_key: key } }),
+    queryFn: () => apiRequest({ path: `/rollups/${id}/drilldown`, params: { rollup_key_b64: key } }),
     enabled: Boolean(id && key),
   })
 }
@@ -219,7 +257,10 @@ export function useRollupDrilldown(id?: number, key?: string) {
 export function useThresholdRules() {
   return useQuery({
     queryKey: ['threshold-rules'],
-    queryFn: () => apiRequest({ path: '/threshold-rules' }).then((res) => ThresholdRuleSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/threshold-rules' }).then((res) =>
+        ThresholdRuleSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
@@ -233,7 +274,10 @@ export function useCreateThresholdRule() {
 export function useBreaches(params?: Record<string, any>) {
   return useQuery({
     queryKey: ['breaches', params],
-    queryFn: () => apiRequest({ path: '/breaches', params }).then((res) => BreachSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/breaches', params }).then((res) =>
+        BreachSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }
 
@@ -254,6 +298,9 @@ export function useUpdateBreachStatus() {
 export function useAuditEvents(params?: Record<string, any>) {
   return useQuery({
     queryKey: ['audit-events', params],
-    queryFn: () => apiRequest({ path: '/audit-events', params }).then((res) => AuditEventSchema.array().parse(res)),
+    queryFn: () =>
+      apiRequest({ path: '/audit-events', params }).then((res) =>
+        AuditEventSchema.array().parse(normalizeListResponse(res))
+      ),
   })
 }

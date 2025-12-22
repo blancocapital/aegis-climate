@@ -8,20 +8,22 @@ import { Button } from '../components/ui/button'
 import { Textarea } from '../components/ui/textarea'
 import { Select } from '../components/ui/select'
 import { Badge } from '../components/ui/badge'
+import { toast } from 'sonner'
 
 export function RollupsPage() {
   const { data: configs = [], refetch } = useRollupConfigs()
   const { data: exposures = [] } = useExposureVersions()
   const createConfig = useCreateRollupConfig()
   const createRollup = useCreateRollup()
-  const [configJson, setConfigJson] = useState('{"dimensions": ["country"], "measures": ["tiv_sum"]}')
+  const [configJson, setConfigJson] = useState('{"dimensions": ["country"], "measures": [{"name": "tiv_sum", "op": "sum", "field": "tiv"}]}')
   const [name, setName] = useState('Country rollup')
   const [selectedConfig, setSelectedConfig] = useState<number | null>(null)
   const [selectedExposure, setSelectedExposure] = useState<number | null>(null)
   const [rollupId, setRollupId] = useState<number | null>(null)
   const rollupQuery = useRollup(rollupId || undefined)
-  const [drillKey, setDrillKey] = useState<string>('')
-  const drillQuery = useRollupDrilldown(rollupId || undefined, drillKey)
+  const [drillKeyJson, setDrillKeyJson] = useState<string>('{}')
+  const [drillKeyB64, setDrillKeyB64] = useState<string>('')
+  const drillQuery = useRollupDrilldown(rollupId || undefined, drillKeyB64)
 
   const configColumns: ColumnDef<any>[] = [
     { header: 'ID', accessorKey: 'id' },
@@ -34,14 +36,45 @@ export function RollupsPage() {
   ]
 
   const saveConfig = async () => {
-    await createConfig.mutateAsync({ name, config_json: JSON.parse(configJson) })
+    let parsed: any
+    try {
+      parsed = JSON.parse(configJson)
+    } catch (err) {
+      toast.error('Config JSON is invalid')
+      return
+    }
+    if (!Array.isArray(parsed.dimensions) || !Array.isArray(parsed.measures)) {
+      toast.error('Config must include dimensions and measures arrays')
+      return
+    }
+    await createConfig.mutateAsync({
+      name,
+      dimensions_json: parsed.dimensions,
+      measures_json: parsed.measures,
+      filters_json: parsed.filters || undefined,
+    })
     refetch()
   }
 
   const startRollup = async () => {
     if (!selectedConfig || !selectedExposure) return
-    const res = await createRollup.mutateAsync({ exposure_version_id: selectedExposure, rollup_config_id: selectedConfig })
+    const res = await createRollup.mutateAsync({
+      exposure_version_id: selectedExposure,
+      rollup_config_id: selectedConfig,
+      hazard_overlay_result_ids: [],
+    })
     setRollupId(res.rollup_result_id)
+  }
+
+  const requestDrilldown = () => {
+    try {
+      const parsed = JSON.parse(drillKeyJson)
+      const raw = JSON.stringify(parsed)
+      const encoded = btoa(raw).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+      setDrillKeyB64(encoded)
+    } catch (err) {
+      toast.error('Drilldown key must be valid JSON')
+    }
   }
 
   return (
@@ -52,7 +85,9 @@ export function RollupsPage() {
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Config name" />
           <Textarea rows={4} value={configJson} onChange={(e) => setConfigJson(e.target.value)} />
         </div>
-        <Button onClick={saveConfig}>Save config</Button>
+        <Button onClick={saveConfig} disabled={createConfig.isLoading}>
+          {createConfig.isLoading ? 'Saving...' : 'Save config'}
+        </Button>
         <DataTable data={configs} columns={configColumns} />
       </Card>
       <Card className="space-y-3">
@@ -74,15 +109,17 @@ export function RollupsPage() {
               </option>
             ))}
           </Select>
-          <Button onClick={startRollup}>Start rollup</Button>
+          <Button onClick={startRollup} disabled={!selectedConfig || !selectedExposure || createRollup.isLoading}>
+            {createRollup.isLoading ? 'Starting...' : 'Start rollup'}
+          </Button>
         </div>
         {rollupId && (
           <div className="space-y-2">
             <Badge>Result {rollupId}</Badge>
             <DataTable data={rollupQuery.data || []} columns={rollupColumns} />
             <div className="flex items-center gap-2">
-              <Input placeholder="Drilldown key" value={drillKey} onChange={(e) => setDrillKey(e.target.value)} />
-              <Button onClick={() => drillQuery.refetch()}>Drilldown</Button>
+              <Input placeholder="Drilldown key JSON" value={drillKeyJson} onChange={(e) => setDrillKeyJson(e.target.value)} />
+              <Button onClick={requestDrilldown}>Drilldown</Button>
             </div>
             {drillQuery.data && <pre className="rounded bg-slate-900 p-3 text-xs text-slate-100">{JSON.stringify(drillQuery.data, null, 2)}</pre>}
           </div>

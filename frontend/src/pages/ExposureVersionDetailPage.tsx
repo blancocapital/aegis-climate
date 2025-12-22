@@ -26,8 +26,9 @@ export function ExposureVersionDetailPage() {
 
   const columns: ColumnDef<ExposureLocation>[] = [
     { header: 'External ID', accessorKey: 'external_location_id' },
-    { header: 'Address', accessorKey: 'address' },
+    { header: 'Address', accessorKey: 'address_line1' },
     { header: 'City', accessorKey: 'city' },
+    { header: 'State', accessorKey: 'state_region' },
     { header: 'Country', accessorKey: 'country' },
     { header: 'Lat', accessorKey: 'latitude' },
     { header: 'Lon', accessorKey: 'longitude' },

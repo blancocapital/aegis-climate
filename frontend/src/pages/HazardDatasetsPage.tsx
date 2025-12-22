@@ -17,21 +17,26 @@ export function HazardDatasetsPage() {
   const versions = useHazardDatasetVersions(selected || undefined)
   const createDataset = useCreateHazardDataset()
   const uploadVersion = useUploadHazardVersion(selected || undefined)
-  const { register, handleSubmit, reset } = useForm<{ name: string; description?: string }>()
+  const { register, handleSubmit, reset } = useForm<{ name: string; peril: string; vendor?: string; coverage_geo?: string; license_ref?: string }>()
+  const [versionLabel, setVersionLabel] = useState<string>('v1')
+  const [effectiveDate, setEffectiveDate] = useState<string>('')
 
   const datasetColumns: ColumnDef<HazardDataset>[] = [
     { header: 'ID', accessorKey: 'id' },
     { header: 'Name', accessorKey: 'name' },
+    { header: 'Peril', accessorKey: 'peril' },
     { header: 'Created', accessorKey: 'created_at', cell: ({ getValue }) => formatDate(getValue() as string) },
   ]
 
   const versionColumns: ColumnDef<HazardDatasetVersion>[] = [
     { header: 'ID', accessorKey: 'id' },
+    { header: 'Label', accessorKey: 'version_label' },
+    { header: 'Effective', accessorKey: 'effective_date', cell: ({ getValue }) => formatDate(getValue() as string) },
     { header: 'Checksum', accessorKey: 'checksum' },
     { header: 'Created', accessorKey: 'created_at', cell: ({ getValue }) => formatDate(getValue() as string) },
   ]
 
-  const onCreate = async (values: { name: string; description?: string }) => {
+  const onCreate = async (values: { name: string; peril: string; vendor?: string; coverage_geo?: string; license_ref?: string }) => {
     await createDataset.mutateAsync(values)
     reset()
     refetch()
@@ -39,7 +44,7 @@ export function HazardDatasetsPage() {
 
   const onUpload = async (file?: File) => {
     if (!file || !selected) return
-    await uploadVersion.mutateAsync({ file })
+    await uploadVersion.mutateAsync({ file, version_label: versionLabel, effective_date: effectiveDate || undefined })
     versions.refetch()
     toast.success('Version uploaded')
   }
@@ -50,8 +55,13 @@ export function HazardDatasetsPage() {
         <h2 className="text-lg font-semibold">Hazard datasets</h2>
         <form className="flex flex-wrap items-end gap-2" onSubmit={handleSubmit(onCreate)}>
           <Input placeholder="Name" {...register('name')} />
-          <Input placeholder="Description" {...register('description')} />
-          <Button type="submit">Create</Button>
+          <Input placeholder="Peril" {...register('peril')} />
+          <Input placeholder="Vendor" {...register('vendor')} />
+          <Input placeholder="Coverage" {...register('coverage_geo')} />
+          <Input placeholder="License ref" {...register('license_ref')} />
+          <Button type="submit" disabled={createDataset.isLoading}>
+            {createDataset.isLoading ? 'Creating...' : 'Create'}
+          </Button>
         </form>
         <DataTable data={datasets} columns={datasetColumns} />
       </Card>
@@ -69,7 +79,24 @@ export function HazardDatasetsPage() {
               </option>
             ))}
           </Select>
-          <input type="file" accept=".json,.geojson" onChange={(e) => onUpload(e.target.files?.[0])} />
+          <Input
+            placeholder="Version label"
+            value={versionLabel}
+            onChange={(e) => setVersionLabel(e.target.value)}
+            disabled={!selected}
+          />
+          <Input
+            placeholder="Effective date (YYYY-MM-DD)"
+            value={effectiveDate}
+            onChange={(e) => setEffectiveDate(e.target.value)}
+            disabled={!selected}
+          />
+          <input
+            type="file"
+            accept=".json,.geojson"
+            disabled={!selected}
+            onChange={(e) => onUpload(e.target.files?.[0])}
+          />
         </div>
         {selected ? <DataTable data={versions.data || []} columns={versionColumns} /> : <p>Select a dataset to view versions.</p>}
       </Card>
