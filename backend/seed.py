@@ -16,8 +16,10 @@ def seed():
         ("readonly@demo.com", UserRole.READ_ONLY),
     ]
     for email, role in users:
+        existing = session.query(User).filter_by(tenant_id=tenant.id, email=email).one_or_none()
+        user_id = existing.id if existing else str(uuid.uuid5(uuid.NAMESPACE_DNS, email))
         user = User(
-            id=str(uuid.uuid4()),
+            id=user_id,
             tenant_id=tenant.id,
             email=email,
             password_hash=hash_password("password"),

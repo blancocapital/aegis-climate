@@ -4,7 +4,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 import jwt
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status, Header
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -13,6 +13,7 @@ from app.core.config import get_settings
 from app.db import get_db
 from app.jobs.celery_app import commit_upload as commit_task
 from app.jobs.celery_app import validate_upload as validate_task
+from app.jobs.celery_app import geocode_and_score as geocode_task
 from app.models import (
     AuditEvent,
     ExposureUpload,
@@ -27,7 +28,7 @@ from app.models import (
     UserRole,
     ValidationResult,
 )
-from app.storage.s3 import compute_checksum, put_object
+from app.storage.s3 import compute_checksum, put_object, get_object
 
 router = APIRouter()
 settings = get_settings()
@@ -58,10 +59,10 @@ def login(payload: Dict[str, str], db: Session = Depends(get_db)) -> Dict[str, s
 
 @router.post("/uploads")
 def create_upload(
-    idempotency_key: Optional[str] = None,
     file: UploadFile = File(...),
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
+    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
 ) -> Dict[str, Any]:
     existing = None
     if idempotency_key:
@@ -106,11 +107,17 @@ def attach_mapping(
     upload = db.get(ExposureUpload, upload_id)
     if not upload or upload.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
+    current_version = db.execute(
+        select(func.max(MappingTemplate.version)).where(
+            MappingTemplate.tenant_id == user.tenant_id, MappingTemplate.name == name
+        )
+    ).scalar()
     template = MappingTemplate(
         tenant_id=user.tenant_id,
         name=name,
-        version=version,
+        version=(current_version or 0) + 1,
         template_json=mapping,
+        created_by=user.user_id,
     )
     db.add(template)
     db.commit()
@@ -129,10 +136,18 @@ def trigger_validate(
     upload = db.get(ExposureUpload, upload_id)
     if not upload or upload.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Upload not found")
-    run = Run(tenant_id=user.tenant_id, run_type=RunType.VALIDATION, status=RunStatus.QUEUED, config_refs_json={"upload_id": upload_id})
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.VALIDATION,
+        status=RunStatus.QUEUED,
+        input_refs_json={"upload_id": upload_id},
+        config_refs_json={"mapping_template_id": upload.mapping_template_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
     db.add(run)
     db.commit()
-    validate_task.delay(upload_id, user.tenant_id)
+    validate_task.delay(run.id, upload_id, user.tenant_id)
     emit_audit(db, user.tenant_id, user.user_id, "validation_requested", {"upload_id": upload_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -141,7 +156,7 @@ def trigger_validate(
 def trigger_commit(
     upload_id: str,
     name: Optional[str] = None,
-    idempotency_key: Optional[str] = None,
+    idempotency_key: Optional[str] = Header(default=None, convert_underscores=False),
     user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
@@ -154,14 +169,31 @@ def trigger_commit(
             select(ExposureVersion).where(
                 ExposureVersion.tenant_id == user.tenant_id,
                 ExposureVersion.upload_id == upload_id,
+                ExposureVersion.idempotency_key == idempotency_key,
             )
         ).scalar_one_or_none()
     if existing:
         return {"exposure_version_id": existing.id}
-    run = Run(tenant_id=user.tenant_id, run_type=RunType.VALIDATION, status=RunStatus.QUEUED, config_refs_json={"stage": "COMMIT", "upload_id": upload_id})
+    latest_vr = db.execute(
+        select(ValidationResult).where(
+            ValidationResult.upload_id == upload_id,
+            ValidationResult.tenant_id == user.tenant_id,
+        ).order_by(ValidationResult.created_at.desc())
+    ).scalar_one_or_none()
+    if not latest_vr or latest_vr.summary_json.get("ERROR"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Validation errors present")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.COMMIT,
+        status=RunStatus.QUEUED,
+        input_refs_json={"upload_id": upload_id},
+        config_refs_json={"mapping_template_id": upload.mapping_template_id, "idempotency_key": idempotency_key},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
     db.add(run)
     db.commit()
-    commit_task.delay(upload_id, user.tenant_id, name or f"Exposure {upload_id}")
+    commit_task.delay(run.id, upload_id, user.tenant_id, name or f"Exposure {upload_id}")
     emit_audit(db, user.tenant_id, user.user_id, "commit_requested", {"upload_id": upload_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -235,8 +267,51 @@ def exposure_exceptions(exposure_version_id: int, user: TokenData = Depends(requ
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     vr = db.execute(select(ValidationResult).where(ValidationResult.upload_id == ev.upload_id, ValidationResult.tenant_id == user.tenant_id)).scalar_one_or_none()
     if not vr:
-        return {"items": []}
-    return {"artifact_uri": vr.row_errors_uri, "checksum": vr.checksum}
+        issues = []
+    else:
+        issues = json.loads(get_object(vr.row_errors_uri.split(f"s3://{settings.minio_bucket}/",1)[1]).decode())
+    quality_rows = db.execute(
+        select(Location).where(
+            Location.exposure_version_id == ev.id,
+            Location.tenant_id == user.tenant_id,
+            Location.quality_tier == "C",
+        )
+    ).scalars().all()
+    items = []
+    for loc in quality_rows:
+        items.append({
+            "type": "QUALITY_TIER_C",
+            "external_location_id": loc.external_location_id,
+            "quality_tier": loc.quality_tier,
+            "reasons": loc.quality_reasons_json or [],
+            "geocode_confidence": loc.geocode_confidence,
+        })
+    for issue in issues:
+        items.append({"type": "VALIDATION_ISSUE", **issue})
+    return {"items": items}
+
+
+@router.post("/exposure-versions/{exposure_version_id}/geocode")
+def trigger_geocode(
+    exposure_version_id: int,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.GEOCODE,
+        status=RunStatus.QUEUED,
+        input_refs_json={"exposure_version_id": exposure_version_id},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    geocode_task.delay(run.id, exposure_version_id, user.tenant_id)
+    return {"run_id": run.id, "status": run.status}
 
 
 @router.get("/runs/{run_id}")

@@ -25,10 +25,3 @@ seed:
 
 test:
 	cd backend && pytest
-cd backend && alembic upgrade head
-
-seed:
-cd backend && python -m seed
-
-test:
-cd backend && pytest
