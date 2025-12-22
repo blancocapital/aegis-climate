@@ -1,7 +1,7 @@
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../auth/useAuth'
 import { Button } from '../components/ui/button'
@@ -19,6 +19,7 @@ type FormValues = z.infer<typeof schema>
 export function LoginPage() {
   const { token, login } = useAuth()
   const navigate = useNavigate()
+  const [loginError, setLoginError] = useState<string | null>(null)
   const {
     register,
     handleSubmit,
@@ -30,7 +31,13 @@ export function LoginPage() {
   }, [token])
 
   const onSubmit = async (values: FormValues) => {
-    await login(values)
+    setLoginError(null)
+    try {
+      await login(values)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Login failed'
+      setLoginError(message)
+    }
   }
 
   return (
@@ -41,6 +48,7 @@ export function LoginPage() {
           <p className="text-sm text-slate-600">Use your tenant credentials.</p>
         </div>
         <form className="space-y-3" onSubmit={handleSubmit(onSubmit)}>
+          {loginError ? <p className="text-sm text-red-600">{loginError}</p> : null}
           <div>
             <label className="text-sm font-medium text-slate-700">Tenant</label>
             <Input {...register('tenant_id')} placeholder="demo" />

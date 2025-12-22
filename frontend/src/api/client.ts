@@ -29,6 +29,22 @@ export function getToken() {
   return localStorage.getItem('token')
 }
 
+async function readErrorMessage(response: Response) {
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    const data = await response.json()
+    if (typeof data === 'string') return data
+    if (data && typeof data === 'object') {
+      if (Array.isArray((data as any).detail)) {
+        return (data as any).detail.map((item: any) => item?.msg || item).join(', ')
+      }
+      if ('detail' in data) return String((data as any).detail)
+    }
+    return JSON.stringify(data)
+  }
+  return await response.text()
+}
+
 export async function apiRequest<T>({ method = 'GET', path, body, params, headers = {}, isMultipart }: RequestOptions): Promise<T> {
   const token = getToken()
   const url = buildUrl(path.startsWith('/api') ? path.replace('/api', '') : path, params)
@@ -51,7 +67,7 @@ export async function apiRequest<T>({ method = 'GET', path, body, params, header
   }
 
   if (!response.ok) {
-    const message = await response.text()
+    const message = await readErrorMessage(response)
     throw new Error(message || 'Request failed')
   }
 
