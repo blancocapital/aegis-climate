@@ -35,17 +35,17 @@ test:
 	cd backend && pytest
 
 qa:
-	docker compose -f infra/docker-compose.yml up -d --build
-	@echo "Waiting for services..."
-	@for i in $$(seq 1 60); do \
-		if curl -sf http://localhost:8000/health > /dev/null && curl -sf http://localhost:5173 > /dev/null; then \
-			echo "Services are ready."; \
-			break; \
-		fi; \
-		sleep 2; \
-	done
-	$(MAKE) migrate
-	$(MAKE) seed
-	cd frontend && npm install
-	cd frontend && npm run build
-	cd frontend && npm run test:e2e
+        docker compose -f infra/docker-compose.yml up -d --build
+        @echo "Waiting for services..."
+        @for i in $$(seq 1 60); do \
+                if curl -sf http://localhost:8000/health > /dev/null && curl -sf http://localhost:5173 > /dev/null; then \
+                        echo "Services are ready."; \
+                        break; \
+                fi; \
+                sleep 2; \
+        done
+        $(MAKE) migrate
+        $(MAKE) seed
+        cd frontend && npm install
+        cd frontend && PLAYWRIGHT_BASE_URL=http://localhost:5173 npm run test:e2e
+        @echo "Artifacts available in qa-results.json, playwright-report/, and test-results/"

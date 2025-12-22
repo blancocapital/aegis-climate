@@ -1,18 +1,18 @@
 # User Tutorial
 
-## Prereqs
+This guide walks through running the Aegis Climate MVP locally and exercising every major feature end-to-end.
+
+## Prerequisites
 - Docker + Docker Compose
-- Node.js 18+
-- Python 3.11+ (for local migrate/seed if you do not rely on Docker containers)
+- Node.js 18+ (only needed if you prefer running the frontend locally)
+- Python 3.11+ (only if running migrations/seeds outside Docker)
 
-## One-command startup
-- `make dev` (wraps `docker compose -f infra/docker-compose.yml up --build`)
+## Startup
+1. From the repo root, launch the stack: `make dev` (wraps `docker compose -f infra/docker-compose.yml up --build`).
+2. Apply migrations and seed demo data: `make migrate` then `make seed`.
+3. The frontend is served on `http://localhost:5173` and the API on `http://localhost:8000`.
 
-## Migrate + seed
-- `make migrate`
-- `make seed`
-
-## Login credentials
+### Login credentials
 All demo users share password `password` and tenant `demo`:
 - Admin: `admin@demo.com`
 - Ops: `ops@demo.com`
@@ -20,56 +20,53 @@ All demo users share password `password` and tenant `demo`:
 - Auditor: `auditor@demo.com`
 - Read-only: `readonly@demo.com`
 
-## End-to-end workflow (all available features)
+## End-to-end workflow
 
 ### 1) Ingest exposures
-1. Go to **Ingestion**.
-2. Upload a CSV (use `sample_data/exposure_small.csv` to start). Ensure the file includes `external_location_id`, `tiv`, and at least one segmentation field (`lob` or `product_code`).
-3. Click **Auto mapping** to populate the mapping JSON, then **Save mapping**.
-4. Click **Validate** and wait for the status to reach `SUCCEEDED`.
-5. Confirm **Errors: 0**, then click **Commit**.
-6. You will be routed to the new exposure version detail.
+1. Navigate to **Ingestion** (landing page after login).
+2. Upload `frontend/tests/fixtures/exposure_e2e.csv` (3 locations across CA/BC with lat/lon and TIV).
+3. Click **Auto mapping** to populate mapping JSON, then **Save mapping**.
+4. Click **Validate** and wait for the run status to reach `SUCCEEDED`. Confirm `Errors: 0` in the stats row.
+5. Click **Commit**. On success you are redirected to the new exposure version detail page with the locations table populated.
 
-### 2) Review exposure versions + locations
-1. Open **Exposure Versions** to see all committed versions.
-2. Click a version to view its **Locations** table.
-3. Optional: run **Geocode + quality** from the detail page to populate quality tiers.
+### 2) Exposure versions, locations, and geocode
+1. Open **Exposure Versions** to see the committed version.
+2. Click the version row to view **Locations** (expect 3 rows).
+3. Optional: click **Run geocode + quality** to trigger the enrichment run. A status badge appears; wait for `SUCCEEDED`.
 
 ### 3) Exceptions queue
 1. Open **Exceptions**.
-2. Select an exposure version.
-3. Review validation issues and data-quality exceptions (quality tier C / low geocode confidence).
+2. Select your exposure version from the dropdown.
+3. Review validation issues or confirm the empty-state message when no exceptions exist.
 
-### 4) Hazard datasets + overlays
+### 4) Hazard datasets and overlays
 1. Open **Hazard Datasets**.
-2. Create a dataset (name + peril).
-3. Upload a GeoJSON file to create a dataset version.
+2. Create a dataset (name + peril are required).
+3. Upload `frontend/tests/fixtures/hazard_demo.geojson` as a version. Two polygons are provided (HIGH over CA, LOW over BC).
 4. Open **Overlays**.
-5. Select exposure version, dataset, and dataset version.
-6. Click **Start overlay** and wait for `SUCCEEDED`.
+5. Select the exposure version, your dataset, and the uploaded dataset version.
+6. Click **Start overlay** and wait for the overlay status to reach `SUCCEEDED`. The summary shows matched bands.
 
-### 5) Rollups + drilldown
+### 5) Rollups and drilldown
 1. Open **Rollups**.
-2. Create a rollup config (dimensions + measures JSON).
-3. Select an exposure version and rollup config, then **Start rollup**.
-4. Inspect rollup rows and run **Drilldown** with a rollup key JSON.
+2. Create a rollup config with dimensions `country`, `hazard_band`, `lob` and measures `tiv_sum` + `location_count`.
+3. Select the exposure version, the rollup config, and (optionally) enter the overlay result ID from the previous step in the overlay field.
+4. Click **Start rollup** and wait for rows to populate.
+5. Use the **Drilldown** input with `{}` or a specific rollup key JSON to view contributing locations.
 
-### 6) Thresholds + breaches
-1. Open **Threshold Rules**.
-2. Create a rule (example JSON: `{ "metric": "tiv_sum", "operator": ">", "value": 1000000 }`).
-3. Open **Breaches**.
-4. Enter a rollup result ID and select a rule.
-5. Click **Run evaluation**; update statuses to **ACKED** or **RESOLVED**.
+### 6) Threshold rules and breaches
+1. Open **Threshold Rules** and create a rule targeting `tiv_sum` with an operator such as `>` and a low value (e.g., `100000`).
+2. Open **Breaches**. Select the rule, select the exposure version, and enter the rollup result ID from step 5.
+3. Click **Run evaluation**. Breaches table rows appear; update statuses to **ACKED** and **RESOLVED** to confirm persistence.
 
 ### 7) Governance views
-- **Runs**: inspect run registry (validation/commit/overlay/rollup/breach/drift).
-- **Audit Log**: review immutable audit events (login, uploads, changes).
+- **Runs**: confirms validate/commit/overlay/rollup/breach runs are registered.
+- **Audit Log**: lists login, upload, commit, and breach status updates.
 
 ## Troubleshooting
-- **401 Unauthorized**: token expired or missing; log in again.
-- **422/400 during validate/commit**: mapping JSON invalid or missing required fields.
-- **Commit disabled**: validation has `ERROR > 0` or validation has not finished.
-- **No locations after commit**: source data missing `lob` or `product_code`.
-- **CORS errors**: ensure `VITE_API_URL` matches the backend URL (default `http://localhost:8000`).
-- **Validation/commit stuck**: confirm the Celery worker is running (Docker `worker` service).
-- **No demo users**: run `make seed` again.
+- **401 Unauthorized**: token expired; log in again.
+- **Commit disabled**: validation is still running or `Errors > 0`.
+- **No overlay versions listed**: ensure the hazard dataset upload succeeded; refresh the Overlays page.
+- **Rollup missing overlay impact**: include overlay result IDs in the rollup form to blend hazard enrichment.
+- **Seed data missing**: rerun `make seed`.
+- **Worker jobs stuck**: check Docker `worker` container logs.
