@@ -1,6 +1,6 @@
 import hashlib
 import json
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 CLASS_ORDER = {"NEW": 0, "REMOVED": 1, "MODIFIED": 2}
 COMPARE_FIELDS = [
@@ -34,7 +34,7 @@ def _stable_sort_key(detail: Dict) -> Tuple:
     return (CLASS_ORDER.get(detail.get("classification"), 99), detail.get("external_location_id", ""))
 
 
-def compare_exposures(locations_a: List[Dict], locations_b: List[Dict], config: Dict | None = None):
+def compare_exposures(locations_a: List[Dict], locations_b: List[Dict], config: Optional[Dict] = None):
     idx_a = {str(r.get("external_location_id")): r for r in locations_a}
     idx_b = {str(r.get("external_location_id")): r for r in locations_b}
     details: List[Dict] = []
