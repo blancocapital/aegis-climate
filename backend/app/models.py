@@ -37,6 +37,7 @@ class RunType(str, enum.Enum):
     OVERLAY = "OVERLAY"
     ROLLUP = "ROLLUP"
     BREACH_EVAL = "BREACH_EVAL"
+    DRIFT = "DRIFT"
 
 
 class RunStatus(str, enum.Enum):
@@ -77,7 +78,7 @@ class AuditEvent(Base):
     tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
     action = Column(String, nullable=False)
-    metadata = Column(JSON, nullable=True)
+    metadata_json = Column("metadata", JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (Index("ix_audit_event_tenant_created", "tenant_id", "created_at"),)
@@ -147,12 +148,48 @@ class ValidationResult(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
     upload_id = Column(String, ForeignKey("exposure_upload.id", ondelete="CASCADE"), nullable=False)
+    mapping_template_id = Column(Integer, ForeignKey("mapping_template.id", ondelete="SET NULL"), nullable=True)
     summary_json = Column(JSON, nullable=False)
     row_errors_uri = Column(String, nullable=False)
     checksum = Column(String, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (Index("ix_validation_tenant_created", "tenant_id", "created_at"),)
+
+
+class DriftRun(Base):
+    __tablename__ = "drift_run"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_a_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_b_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    config_json = Column(JSON, nullable=True)
+    storage_uri = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+
+    __table_args__ = (Index("ix_drift_run_tenant_created", "tenant_id", "created_at"),)
+
+
+class DriftDetail(Base):
+    __tablename__ = "drift_detail"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    drift_run_id = Column(Integer, ForeignKey("drift_run.id", ondelete="CASCADE"), nullable=False)
+    external_location_id = Column(String, nullable=False)
+    classification = Column(String, nullable=False)
+    delta_json = Column(JSON, nullable=False)
+
+    __table_args__ = (
+        Index("ix_drift_detail_tenant_run", "tenant_id", "drift_run_id"),
+        Index("ix_drift_detail_run_class", "drift_run_id", "classification"),
+        UniqueConstraint(
+            "tenant_id", "drift_run_id", "external_location_id", name="uq_drift_detail_unique"
+        ),
+    )
 
 
 class ExposureVersion(Base):

@@ -11,25 +11,27 @@ from app.core.config import get_settings
 from app.db import SessionLocal
 from sqlalchemy import func
 from app.models import (
+    Breach,
+    DriftDetail,
+    DriftRun,
     ExposureUpload,
-    Location,
-    MappingTemplate,
-    Run,
-    RunStatus,
-    RunType,
-    ValidationResult,
     ExposureVersion,
-    Tenant,
     HazardDataset,
     HazardDatasetVersion,
     HazardFeaturePolygon,
     HazardOverlayResult,
+    Location,
     LocationHazardAttribute,
+    MappingTemplate,
     RollupConfig,
     RollupResult,
     RollupResultItem,
+    Run,
+    RunStatus,
+    RunType,
+    Tenant,
     ThresholdRule,
-    Breach,
+    ValidationResult,
 )
 from app.services.validation import read_csv_bytes, validate_rows
 from app.services.commit import canonicalize_rows, to_location_dict
@@ -37,6 +39,7 @@ from app.services.geocode import geocode_address
 from app.services.quality import quality_scores
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
+from app.services.drift import COMPARE_FIELDS, compare_exposures
 from app.storage.s3 import compute_checksum, get_object, put_object
 
 settings = get_settings()
@@ -69,6 +72,7 @@ def validate_upload(run_id: int, upload_id: str, tenant_id: str):
         validation = ValidationResult(
             tenant_id=tenant_id,
             upload_id=upload_id,
+            mapping_template_id=upload.mapping_template_id,
             summary_json=summary,
             row_errors_uri=uri,
             checksum=checksum,
@@ -392,6 +396,9 @@ def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str):
                 loc.longitude = lon
                 loc.geocode_method = method
                 loc.geocode_confidence = conf
+            elif loc.geocode_confidence is None:
+                loc.geocode_method = "PROVIDED"
+                loc.geocode_confidence = 1.0
             scores = quality_scores({
                 "address_line1": loc.address_line1,
                 "tiv": loc.tiv,
@@ -463,10 +470,12 @@ def overlay_hazard(
                 continue
             props = feature.properties_json or {}
             attributes = {
-                "hazard_category": props.get("hazard_category")
-                or props.get("peril")
-                or props.get("hazard")
-                or hazard_dataset.peril if hazard_dataset else None,
+                "hazard_category": (
+                    props.get("hazard_category")
+                    or props.get("peril")
+                    or props.get("hazard")
+                    or (hazard_dataset.peril if hazard_dataset else None)
+                ),
                 "band": props.get("band") or props.get("Band"),
                 "percentile": props.get("percentile"),
                 "score": props.get("score"),
@@ -494,6 +503,75 @@ def overlay_hazard(
                 "attributes_created": len(saved_attrs),
             },
         }
+        run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def drift_compare(
+    run_id: int,
+    drift_run_id: int,
+    exposure_version_a_id: int,
+    exposure_version_b_id: int,
+    tenant_id: str,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    drift_run = session.get(DriftRun, drift_run_id)
+    if not run or not drift_run or run.tenant_id != tenant_id or drift_run.tenant_id != tenant_id:
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        locs_a = session.query(Location).filter(
+            Location.tenant_id == tenant_id, Location.exposure_version_id == exposure_version_a_id
+        ).all()
+        locs_b = session.query(Location).filter(
+            Location.tenant_id == tenant_id, Location.exposure_version_id == exposure_version_b_id
+        ).all()
+        loc_dict_a = [
+            {field: getattr(l, field) for field in COMPARE_FIELDS}
+            for l in locs_a
+        ]
+        loc_dict_b = [
+            {field: getattr(l, field) for field in COMPARE_FIELDS}
+            for l in locs_b
+        ]
+        summary, details, artifact_bytes, checksum = compare_exposures(loc_dict_a, loc_dict_b, drift_run.config_json or {})
+        key = f"drift/{tenant_id}/{drift_run_id}/details.json"
+        uri = put_object(key, artifact_bytes, content_type="application/json")
+        drift_run.storage_uri = uri
+        drift_run.checksum = checksum
+        detail_rows = [
+            DriftDetail(
+                tenant_id=tenant_id,
+                drift_run_id=drift_run_id,
+                external_location_id=d["external_location_id"],
+                classification=d["classification"],
+                delta_json=d["delta_json"],
+            )
+            for d in details
+        ]
+        if detail_rows:
+            session.bulk_save_objects(detail_rows)
+        session.commit()
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {
+            "drift_run_id": drift_run_id,
+            "storage_uri": uri,
+            "checksum": checksum,
+            "summary": summary,
+        }
+        run.artifact_checksums_json = {"drift_details": checksum}
         run.code_version = settings.code_version
         session.commit()
     except Exception:

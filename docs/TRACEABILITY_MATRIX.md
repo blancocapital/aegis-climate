@@ -9,7 +9,7 @@ Links functional requirements to planned implementations (endpoints/jobs/tables/
 | Hazard datasets + overlays | /hazard-overlays (job), /hazard-overlays/{id}/status/summary | hazard_dataset, hazard_dataset_version, hazard_overlay_result, location_hazard_attribute | Overlay status | Unit: overlay join |
 | Rollups + drilldown | /rollup-configs, /rollups, /rollups/{id}, /rollups/{id}/drilldown | rollup_config, rollup_result | Accumulation dashboard | Unit: rollup aggregation; Integration: rollup endpoints |
 | Threshold rules + breaches workflow | /threshold-rules, /breaches/run, /breaches, /breaches/{id} PATCH | threshold_rule, breach | Threshold builder + breach list | Unit: threshold evaluation; Integration: breach workflow |
-| Drift report | /drift (job), /drift/{id}, /drift/{id}/details | drift_run, drift_detail | Drift report page | Unit: drift classification; Integration: drift endpoints |
-| Governance runs + lineage | /runs/{id}, /lineage | run | Governance: Runs/Lineage | Integration: lineage correctness |
+| Drift report | /drift (job), /drift/{id}, /drift/{id}/details | drift_run, drift_detail | Drift report page | Unit: test_drift_service; Integration: drift endpoints |
+| Governance runs + lineage | /runs/{id}, /lineage | run | Governance: Runs/Lineage | Unit: test_lineage; Integration: lineage correctness |
 | Audit log | /audit-events | audit_event | Audit log viewer | Integration: audit visibility |
 | Golden determinism | pipeline executions recorded via run with checksums | run.artifact_checksums_json | Governance views | Determinism/golden dataset tests |

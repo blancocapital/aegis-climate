@@ -17,8 +17,11 @@ from app.db import get_db
 from app.jobs.celery_app import commit_upload as commit_task
 from app.jobs.celery_app import validate_upload as validate_task
 from app.jobs.celery_app import geocode_and_score as geocode_task
+from app.jobs.celery_app import drift_compare as drift_task
 from app.models import (
     AuditEvent,
+    DriftDetail,
+    DriftRun,
     ExposureUpload,
     ExposureVersion,
     Location,
@@ -41,6 +44,7 @@ from app.models import (
     ThresholdRule,
     Breach,
 )
+from app.services.lineage import build_lineage
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
@@ -51,7 +55,7 @@ settings = get_settings()
 
 
 def emit_audit(session: Session, tenant_id: str, user_id: Optional[str], action: str, metadata: Optional[dict] = None):
-    event = AuditEvent(tenant_id=tenant_id, user_id=user_id, action=action, metadata=metadata or {})
+    event = AuditEvent(tenant_id=tenant_id, user_id=user_id, action=action, metadata_json=metadata or {})
     session.add(event)
     session.commit()
 
@@ -73,6 +77,12 @@ class HazardOverlayRequest(BaseModel):
     exposure_version_id: int
     hazard_dataset_version_ids: List[int]
     params: Optional[Dict[str, Any]] = None
+
+
+class DriftRequest(BaseModel):
+    exposure_version_a: int
+    exposure_version_b: int
+    config: Optional[Dict[str, Any]] = None
 
 
 class RollupConfigCreate(BaseModel):
@@ -105,7 +115,18 @@ def login(payload: Dict[str, str], db: Session = Depends(get_db)) -> Dict[str, s
     email = payload.get("email")
     password = payload.get("password")
     tenant_id = payload.get("tenant_id")
-    user = db.execute(select(User).where(User.email == email)).scalar_one_or_none()
+    query = select(User).where(User.email == email)
+    if tenant_id:
+        query = query.where(User.tenant_id == tenant_id)
+        user = db.execute(query).scalar_one_or_none()
+    else:
+        users = db.execute(query).scalars().all()
+        if len(users) > 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="tenant_id required when multiple tenants share this email",
+            )
+        user = users[0] if users else None
     if not user:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     if tenant_id and user.tenant_id != tenant_id:
@@ -249,6 +270,11 @@ def trigger_commit(
     ).scalar_one_or_none()
     if not latest_vr or latest_vr.summary_json.get("ERROR"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Validation errors present")
+    if latest_vr.mapping_template_id != upload.mapping_template_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Validation must match current mapping template",
+        )
     run = Run(
         tenant_id=user.tenant_id,
         run_type=RunType.COMMIT,
@@ -600,6 +626,106 @@ def overlay_summary(overlay_result_id: int, user: TokenData = Depends(require_ro
     }
 
 
+@router.post("/drift")
+def trigger_drift(
+    payload: DriftRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev_a = db.get(ExposureVersion, payload.exposure_version_a)
+    ev_b = db.get(ExposureVersion, payload.exposure_version_b)
+    if not ev_a or not ev_b or ev_a.tenant_id != user.tenant_id or ev_b.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.DRIFT,
+        status=RunStatus.QUEUED,
+        input_refs_json={"exposure_version_a": ev_a.id, "exposure_version_b": ev_b.id},
+        config_refs_json=payload.config or {},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    drift_run = DriftRun(
+        tenant_id=user.tenant_id,
+        exposure_version_a_id=ev_a.id,
+        exposure_version_b_id=ev_b.id,
+        config_json=payload.config or {},
+        run_id=run.id,
+    )
+    db.add(drift_run)
+    db.commit()
+    drift_task.delay(run.id, drift_run.id, ev_a.id, ev_b.id, user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "drift_requested", {"drift_run_id": drift_run.id})
+    return {"run_id": run.id, "drift_run_id": drift_run.id}
+
+
+@router.get("/drift/{drift_run_id}")
+def get_drift(
+    drift_run_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    drift_run = db.get(DriftRun, drift_run_id)
+    if not drift_run or drift_run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, drift_run.run_id) if drift_run.run_id else None
+    return {
+        "drift_run_id": drift_run.id,
+        "exposure_version_a": drift_run.exposure_version_a_id,
+        "exposure_version_b": drift_run.exposure_version_b_id,
+        "storage_uri": drift_run.storage_uri,
+        "checksum": drift_run.checksum,
+        "run_status": run.status if run else None,
+        "summary": run.output_refs_json.get("summary") if run and run.output_refs_json else None,
+    }
+
+
+@router.get("/drift/{drift_run_id}/details")
+def drift_details(
+    drift_run_id: int,
+    classification: Optional[str] = None,
+    limit: int = 200,
+    offset: int = 0,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    drift_run = db.get(DriftRun, drift_run_id)
+    if not drift_run or drift_run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    query = select(DriftDetail).where(DriftDetail.tenant_id == user.tenant_id, DriftDetail.drift_run_id == drift_run_id)
+    if classification:
+        query = query.where(DriftDetail.classification == classification)
+    total = db.execute(query.with_only_columns(func.count())).scalar()
+    rows = db.execute(query.order_by(DriftDetail.classification, DriftDetail.external_location_id).limit(limit).offset(offset)).scalars().all()
+    return {
+        "items": [
+            {
+                "external_location_id": d.external_location_id,
+                "classification": d.classification,
+                "delta": d.delta_json,
+            }
+            for d in rows
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 @router.post("/rollup-configs")
 def create_rollup_config(
     payload: RollupConfigCreate,
@@ -937,6 +1063,25 @@ def update_breach_status(
     return {"breach_id": breach.id, "status": breach.status}
 
 
+@router.get("/lineage")
+def get_lineage(
+    entity_type: str,
+    entity_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    lineage = build_lineage(db, user.tenant_id, entity_type, entity_id)
+    if not lineage:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Lineage not found")
+    return lineage
+
+
 @router.get("/runs/{run_id}")
 def get_run(run_id: int, user: TokenData = Depends(require_role(
     UserRole.ADMIN.value,
@@ -974,7 +1119,7 @@ def list_audit_events(user: TokenData = Depends(require_role(
 )), db: Session = Depends(get_db)) -> Dict[str, Any]:
     events = db.execute(select(AuditEvent).where(AuditEvent.tenant_id == user.tenant_id).order_by(AuditEvent.created_at.desc())).scalars().all()
     return {"items": [
-        {"action": e.action, "created_at": e.created_at.isoformat(), "user_id": e.user_id, "metadata": e.metadata}
+        {"action": e.action, "created_at": e.created_at.isoformat(), "user_id": e.user_id, "metadata": e.metadata_json}
         for e in events
     ]}
 
