@@ -35,4 +35,5 @@ make frontend
 
 ## Git remote
 - `origin` is configured to point at `https://github.com/aegis-climate/aegis-climate.git` for pushing to the GitHub repository.
-- You will need appropriate GitHub credentials (token or SSH deploy key) in this environment to complete a `git push`.
+- To verify, run `git remote -v`.
+- You will need appropriate GitHub credentials (token or SSH deploy key) in this environment to complete a `git push`; if your network blocks outbound GitHub traffic (e.g., CONNECT 403), configure an allowed proxy or perform the push from another environment.
