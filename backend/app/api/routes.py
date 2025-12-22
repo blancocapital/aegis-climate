@@ -635,7 +635,7 @@ def upload_hazard_dataset_version(
             HazardFeaturePolygon(
                 tenant_id=user.tenant_id,
                 hazard_dataset_version_id=version.id,
-                geom=func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326),
+                geom=func.ST_Multi(func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326)),
                 properties_json=feature.get("properties") or {},
             )
         )
