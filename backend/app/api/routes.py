@@ -44,7 +44,9 @@ from app.models import (
     ThresholdRule,
     Breach,
 )
+from app.services.geocode import geocode_address
 from app.services.lineage import build_lineage
+from app.services.resilience import compute_resilience_score
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
@@ -98,6 +100,24 @@ class HazardOverlayRequest(BaseModel):
     exposure_version_id: int
     hazard_dataset_version_ids: List[int]
     params: Optional[Dict[str, Any]] = None
+
+
+class ResilienceStructural(BaseModel):
+    roof_material: Optional[str] = None
+    elevation_m: Optional[float] = None
+    vegetation_proximity_m: Optional[float] = None
+
+
+class ResilienceScoreRequest(BaseModel):
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+    address_line1: Optional[str] = None
+    city: Optional[str] = None
+    state_region: Optional[str] = None
+    postal_code: Optional[str] = None
+    country: Optional[str] = None
+    structural: Optional[ResilienceStructural] = None
+    hazard_dataset_version_ids: Optional[List[int]] = None
 
 
 class DriftRequest(BaseModel):
@@ -681,6 +701,128 @@ def list_hazard_dataset_versions(hazard_dataset_id: int, user: TokenData = Depen
         }
         for r in rows
     ]}
+
+
+@router.post("/resilience/score")
+def score_resilience(
+    payload: ResilienceScoreRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    lat = payload.lat
+    lon = payload.lon
+    geocode_method = None
+    geocode_confidence = None
+    if lat is None or lon is None:
+        if not (payload.address_line1 and payload.city and payload.country):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="lat/lon or address_line1, city, country required",
+            )
+        lat, lon, geocode_confidence, geocode_method = geocode_address(
+            payload.address_line1,
+            payload.city,
+            payload.country,
+            postal_code=payload.postal_code or "",
+            state_region=payload.state_region or "",
+        )
+    else:
+        geocode_method = "PROVIDED"
+        geocode_confidence = 1.0
+
+    version_ids: List[int] = []
+    if payload.hazard_dataset_version_ids is not None:
+        requested_ids = payload.hazard_dataset_version_ids
+        if requested_ids:
+            version_ids = db.execute(
+                select(HazardDatasetVersion.id).where(
+                    HazardDatasetVersion.tenant_id == user.tenant_id,
+                    HazardDatasetVersion.id.in_(requested_ids),
+                )
+            ).scalars().all()
+            if not version_ids:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hazard dataset versions not found")
+    else:
+        datasets = db.execute(
+            select(HazardDataset).where(HazardDataset.tenant_id == user.tenant_id)
+        ).scalars().all()
+        for dataset in datasets:
+            latest = db.execute(
+                select(HazardDatasetVersion.id)
+                .where(
+                    HazardDatasetVersion.tenant_id == user.tenant_id,
+                    HazardDatasetVersion.hazard_dataset_id == dataset.id,
+                )
+                .order_by(
+                    HazardDatasetVersion.effective_date.desc().nullslast(),
+                    HazardDatasetVersion.created_at.desc(),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest:
+                version_ids.append(latest)
+
+    hazards: Dict[str, Dict[str, Any]] = {}
+    if version_ids:
+        point = func.ST_SetSRID(func.ST_MakePoint(lon, lat), 4326)
+        rows = db.execute(
+            select(HazardFeaturePolygon, HazardDatasetVersion, HazardDataset)
+            .join(HazardDatasetVersion, HazardFeaturePolygon.hazard_dataset_version_id == HazardDatasetVersion.id)
+            .join(HazardDataset, HazardDatasetVersion.hazard_dataset_id == HazardDataset.id)
+            .where(
+                HazardFeaturePolygon.tenant_id == user.tenant_id,
+                HazardDatasetVersion.tenant_id == user.tenant_id,
+                HazardDataset.tenant_id == user.tenant_id,
+                HazardFeaturePolygon.hazard_dataset_version_id.in_(version_ids),
+                func.ST_Contains(HazardFeaturePolygon.geom, point),
+            )
+        ).all()
+        for feature, version, dataset in rows:
+            properties = feature.properties_json or {}
+            peril_value = properties.get("hazard_category") or dataset.peril
+            if not peril_value:
+                continue
+            peril = str(peril_value).lower()
+            score_value = properties.get("score")
+            try:
+                score = float(score_value) if score_value is not None else None
+            except (TypeError, ValueError):
+                score = None
+            entry = {
+                "score": score,
+                "band": properties.get("band"),
+                "source": f"{dataset.name}:{version.version_label}",
+                "raw": properties,
+            }
+            existing = hazards.get(peril)
+            if existing is None:
+                hazards[peril] = entry
+                continue
+            existing_score = existing.get("score")
+            if score is None:
+                if existing_score is None:
+                    hazards[peril] = existing
+                continue
+            if existing_score is None or score > existing_score:
+                hazards[peril] = entry
+
+    structural = payload.structural.dict() if payload.structural else {}
+    result = compute_resilience_score(hazards, structural, None)
+    hazard_response = {
+        peril: {"score": data.get("score"), "band": data.get("band"), "source": data.get("source")}
+        for peril, data in hazards.items()
+    }
+
+    return {
+        "location": {
+            "lat": lat,
+            "lon": lon,
+            "geocode_method": geocode_method,
+            "geocode_confidence": geocode_confidence,
+        },
+        "hazards": hazard_response,
+        "result": result,
+    }
 
 
 @router.post("/hazard-overlays")
