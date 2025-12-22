@@ -1,4 +1,5 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
+import { useLocation } from 'react-router-dom'
 import { useCreateOverlay, useExposureVersions, useHazardDatasetVersions, useHazardDatasets, useOverlayStatus, useOverlaySummary } from '../api/hooks'
 import { Card } from '../components/ui/card'
 import { Select } from '../components/ui/select'
@@ -16,6 +17,29 @@ export function OverlaysPage() {
   const summaryQuery = useOverlaySummary(overlayId || undefined)
   const createOverlay = useCreateOverlay()
   const [exposureId, setExposureId] = useState<number | null>(null)
+  const location = useLocation()
+
+  useEffect(() => {
+    const params = new URLSearchParams(location.search)
+    const datasetParam = params.get('datasetId')
+    const versionParam = params.get('versionId')
+    const exposureParam = params.get('exposureId')
+
+    if (datasetParam) {
+      const parsed = Number(datasetParam)
+      if (!Number.isNaN(parsed)) setDatasetId(parsed)
+    }
+
+    if (versionParam) {
+      const parsed = Number(versionParam)
+      if (!Number.isNaN(parsed)) setSelectedVersion(parsed)
+    }
+
+    if (exposureParam) {
+      const parsed = Number(exposureParam)
+      if (!Number.isNaN(parsed)) setExposureId(parsed)
+    }
+  }, [location.search])
 
   const startOverlay = async () => {
     if (!exposureId || !selectedVersion) return

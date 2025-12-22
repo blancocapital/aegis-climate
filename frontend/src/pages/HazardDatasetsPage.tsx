@@ -7,6 +7,7 @@ import { DataTable } from '../components/DataTable'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Select } from '../components/ui/select'
 import { formatDate } from '../utils/date'
 import { toast } from 'sonner'
@@ -20,6 +21,7 @@ export function HazardDatasetsPage() {
   const { register, handleSubmit, reset } = useForm<{ name: string; peril: string; vendor?: string; coverage_geo?: string; license_ref?: string }>()
   const [versionLabel, setVersionLabel] = useState<string>('v1')
   const [effectiveDate, setEffectiveDate] = useState<string>('')
+  const navigate = useNavigate()
 
   const datasetColumns: ColumnDef<HazardDataset>[] = [
     { header: 'ID', accessorKey: 'id' },
@@ -66,11 +68,24 @@ export function HazardDatasetsPage() {
         <DataTable data={datasets} columns={datasetColumns} />
       </Card>
       <Card className="space-y-3">
-        <div className="flex items-center gap-3">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-lg font-semibold">Dataset versions</h3>
             <p className="text-sm text-slate-600">Upload GeoJSON to create a new version.</p>
           </div>
+          <Button
+            variant="outline"
+            disabled={!selected || !versions.data?.length}
+            onClick={() => {
+              if (!selected) return
+              const latestVersionId = versions.data?.[0]?.id
+              navigate(`/overlays?datasetId=${selected}${latestVersionId ? `&versionId=${latestVersionId}` : ''}`)
+            }}
+          >
+            Start overlay
+          </Button>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
           <Select value={selected?.toString() || ''} onChange={(e) => setSelected(Number(e.target.value))}>
             <option value="">Select dataset</option>
             {datasets.map((d) => (
