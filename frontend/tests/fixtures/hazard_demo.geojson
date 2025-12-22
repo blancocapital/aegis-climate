@@ -1,0 +1,33 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"hazard_category": "wind", "band": "HIGH", "score": 0.9},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-123.7, 37.0],
+          [-121.0, 37.0],
+          [-121.0, 39.0],
+          [-123.7, 39.0],
+          [-123.7, 37.0]
+        ]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"hazard_category": "wind", "band": "LOW", "percentile": 0.2},
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[
+          [-123.5, 48.5],
+          [-122.5, 48.5],
+          [-122.5, 49.5],
+          [-123.5, 49.5],
+          [-123.5, 48.5]
+        ]]
+      }
+    }
+  ]
+}

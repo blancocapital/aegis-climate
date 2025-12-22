@@ -20,6 +20,7 @@ export function RollupsPage() {
   const [selectedConfig, setSelectedConfig] = useState<number | null>(null)
   const [selectedExposure, setSelectedExposure] = useState<number | null>(null)
   const [rollupId, setRollupId] = useState<number | null>(null)
+  const [overlayIds, setOverlayIds] = useState<string>('')
   const rollupQuery = useRollup(rollupId || undefined)
   const [drillKeyJson, setDrillKeyJson] = useState<string>('{}')
   const [drillKeyB64, setDrillKeyB64] = useState<string>('')
@@ -58,10 +59,16 @@ export function RollupsPage() {
 
   const startRollup = async () => {
     if (!selectedConfig || !selectedExposure) return
+    const parsedOverlayIds = overlayIds
+      .split(',')
+      .map((id) => id.trim())
+      .filter(Boolean)
+      .map((id) => Number(id))
+      .filter((id) => !Number.isNaN(id))
     const res = await createRollup.mutateAsync({
       exposure_version_id: selectedExposure,
       rollup_config_id: selectedConfig,
-      hazard_overlay_result_ids: [],
+      hazard_overlay_result_ids: parsedOverlayIds,
     })
     setRollupId(res.rollup_result_id)
   }
@@ -109,6 +116,11 @@ export function RollupsPage() {
               </option>
             ))}
           </Select>
+          <Input
+            placeholder="Overlay result IDs (comma separated)"
+            value={overlayIds}
+            onChange={(e) => setOverlayIds(e.target.value)}
+          />
           <Button onClick={startRollup} disabled={!selectedConfig || !selectedExposure || createRollup.isLoading}>
             {createRollup.isLoading ? 'Starting...' : 'Start rollup'}
           </Button>

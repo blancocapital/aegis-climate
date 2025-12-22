@@ -1,0 +1,4 @@
+external_location_id,address_line1,city,state_region,country,lat,lon,tiv,currency,lob
+US-SF-1,1 Market St,San Francisco,CA,US,37.7749,-122.4194,1000000,USD,PROPERTY
+US-SAC-2,5 Capitol Mall,Sacramento,CA,US,38.5816,-121.4944,500000,USD,PROPERTY
+CA-BC-1,700 W Georgia St,Vancouver,BC,CA,49.2827,-123.1207,750000,CAD,CASUALTY
