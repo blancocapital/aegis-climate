@@ -1,6 +1,7 @@
 import io
 import json
 import uuid
+import base64
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 from pydantic import BaseModel
@@ -34,9 +35,16 @@ from app.models import (
     HazardFeaturePolygon,
     HazardOverlayResult,
     LocationHazardAttribute,
+    RollupConfig,
+    RollupResult,
+    RollupResultItem,
+    ThresholdRule,
+    Breach,
 )
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
+from app.jobs.celery_app import rollup_execute as rollup_task
+from app.jobs.celery_app import breach_evaluate as breach_task
 
 router = APIRouter()
 settings = get_settings()
@@ -65,6 +73,31 @@ class HazardOverlayRequest(BaseModel):
     exposure_version_id: int
     hazard_dataset_version_ids: List[int]
     params: Optional[Dict[str, Any]] = None
+
+
+class RollupConfigCreate(BaseModel):
+    name: str
+    dimensions_json: List[str]
+    filters_json: Optional[Dict[str, Any]] = None
+    measures_json: List[Dict[str, Any]]
+
+
+class RollupRequest(BaseModel):
+    exposure_version_id: int
+    rollup_config_id: int
+    hazard_overlay_result_ids: List[int]
+
+
+class ThresholdRuleCreate(BaseModel):
+    name: str
+    severity: str
+    active: bool = True
+    rule_json: Dict[str, Any]
+
+
+class BreachEvalRequest(BaseModel):
+    rollup_result_id: int
+    threshold_rule_ids: Optional[List[int]] = None
 
 
 @router.post("/auth/login")
@@ -371,6 +404,7 @@ def create_hazard_dataset(
     )
     db.add(dataset)
     db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "hazard_dataset_created", {"hazard_dataset_id": dataset.id})
     return {"hazard_dataset_id": dataset.id}
 
 
@@ -419,8 +453,11 @@ def upload_hazard_dataset_version(
     geojson = json.loads(raw.decode())
     features = geojson.get("features", [])
     for feature in features:
-        geom_json = json.dumps(feature.get("geometry"))
-        geometry = func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326)
+        try:
+            geom_json = json.dumps(feature.get("geometry"))
+            geometry = func.ST_Multi(func.ST_SetSRID(func.ST_GeomFromGeoJSON(geom_json), 4326))
+        except Exception:
+            continue
         db.add(
             HazardFeaturePolygon(
                 tenant_id=user.tenant_id,
@@ -430,6 +467,13 @@ def upload_hazard_dataset_version(
             )
         )
     db.commit()
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "hazard_dataset_version_uploaded",
+        {"hazard_dataset_version_id": version.id},
+    )
     return {"hazard_dataset_version_id": version.id}
 
 
@@ -456,7 +500,7 @@ def list_hazard_dataset_versions(hazard_dataset_id: int, user: TokenData = Depen
 @router.post("/hazard-overlays")
 def trigger_hazard_overlays(
     payload: HazardOverlayRequest,
-    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     ev = db.get(ExposureVersion, payload.exposure_version_id)
@@ -478,8 +522,23 @@ def trigger_hazard_overlays(
         )
         db.add(run)
         db.commit()
-        overlay_task.delay(run.id, payload.exposure_version_id, hdv_id, user.tenant_id, payload.params or {})
-        overlay_runs.append({"run_id": run.id, "hazard_dataset_version_id": hdv_id})
+        overlay_result = HazardOverlayResult(
+            tenant_id=user.tenant_id,
+            exposure_version_id=payload.exposure_version_id,
+            hazard_dataset_version_id=hdv_id,
+            method="POSTGIS_SPATIAL_JOIN",
+            params_json=payload.params or {},
+            run_id=run.id,
+        )
+        db.add(overlay_result)
+        db.commit()
+        overlay_task.delay(run.id, overlay_result.id, payload.exposure_version_id, hdv_id, user.tenant_id, payload.params or {})
+        overlay_runs.append({
+            "run_id": run.id,
+            "hazard_overlay_result_id": overlay_result.id,
+            "hazard_dataset_version_id": hdv_id,
+        })
+    emit_audit(db, user.tenant_id, user.user_id, "hazard_overlay_requested", {"count": len(overlay_runs)})
     return {"overlay_requests": overlay_runs}
 
 
@@ -527,7 +586,10 @@ def overlay_summary(overlay_result_id: int, user: TokenData = Depends(require_ro
     ).scalar()
     band_counts = db.execute(
         select(LocationHazardAttribute.attributes_json["band"], func.count())
-        .where(LocationHazardAttribute.hazard_overlay_result_id == overlay.id)
+        .where(
+            LocationHazardAttribute.hazard_overlay_result_id == overlay.id,
+            LocationHazardAttribute.tenant_id == user.tenant_id,
+        )
         .group_by(LocationHazardAttribute.attributes_json["band"])
     ).all()
     return {
@@ -536,6 +598,343 @@ def overlay_summary(overlay_result_id: int, user: TokenData = Depends(require_ro
         "matched": matched,
         "band_distribution": {str(band): count for band, count in band_counts},
     }
+
+
+@router.post("/rollup-configs")
+def create_rollup_config(
+    payload: RollupConfigCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    max_version = db.execute(
+        select(func.max(RollupConfig.version)).where(
+            RollupConfig.tenant_id == user.tenant_id, RollupConfig.name == payload.name
+        )
+    ).scalar()
+    next_version = (max_version or 0) + 1
+    config = RollupConfig(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        version=next_version,
+        dimensions_json=payload.dimensions_json,
+        filters_json=payload.filters_json,
+        measures_json=payload.measures_json,
+        created_by=user.user_id,
+    )
+    db.add(config)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "rollup_config_created", {"rollup_config_id": config.id})
+    return {"rollup_config_id": config.id, "name": config.name, "version": config.version}
+
+
+@router.get("/rollup-configs")
+def list_rollup_configs(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    configs = db.execute(select(RollupConfig).where(RollupConfig.tenant_id == user.tenant_id)).scalars().all()
+    return {"items": [
+        {
+            "id": c.id,
+            "name": c.name,
+            "version": c.version,
+            "dimensions": c.dimensions_json,
+            "created_at": c.created_at,
+        }
+        for c in configs
+    ]}
+
+
+@router.post("/rollups")
+def trigger_rollup(
+    payload: RollupRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    exposure_version = db.get(ExposureVersion, payload.exposure_version_id)
+    config = db.get(RollupConfig, payload.rollup_config_id)
+    if not exposure_version or exposure_version.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    if not config or config.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup config not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.ROLLUP,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "exposure_version_id": payload.exposure_version_id,
+            "rollup_config_id": payload.rollup_config_id,
+            "hazard_overlay_result_ids": payload.hazard_overlay_result_ids,
+        },
+        config_refs_json={"rollup_config_version": config.version},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    rollup_result = RollupResult(
+        tenant_id=user.tenant_id,
+        exposure_version_id=payload.exposure_version_id,
+        rollup_config_id=payload.rollup_config_id,
+        hazard_overlay_result_ids_json=payload.hazard_overlay_result_ids,
+        run_id=run.id,
+    )
+    db.add(rollup_result)
+    db.commit()
+    rollup_task.delay(
+        run.id,
+        rollup_result.id,
+        payload.exposure_version_id,
+        payload.rollup_config_id,
+        payload.hazard_overlay_result_ids,
+        user.tenant_id,
+    )
+    emit_audit(db, user.tenant_id, user.user_id, "rollup_requested", {"rollup_result_id": rollup_result.id})
+    return {"run_id": run.id, "rollup_result_id": rollup_result.id}
+
+
+@router.get("/rollups/{rollup_result_id}")
+def rollup_result_detail(rollup_result_id: int, user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    result = db.get(RollupResult, rollup_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    config = db.get(RollupConfig, result.rollup_config_id)
+    items_query = db.query(RollupResultItem).filter(
+        RollupResultItem.tenant_id == user.tenant_id, RollupResultItem.rollup_result_id == rollup_result_id
+    )
+    total = items_query.count()
+    items = items_query.order_by(RollupResultItem.rollup_key_hash.asc()).limit(100).all()
+    return {
+        "rollup_result_id": result.id,
+        "checksum": result.checksum,
+        "rollup_config": {"id": config.id, "name": config.name, "version": config.version} if config else None,
+        "exposure_version_id": result.exposure_version_id,
+        "items": [
+            {"rollup_key": item.rollup_key_json, "metrics": item.metrics_json}
+            for item in items
+        ],
+        "total_items": total,
+    }
+
+
+@router.get("/rollups/{rollup_result_id}/drilldown")
+def rollup_drilldown(
+    rollup_result_id: int,
+    rollup_key_b64: str,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(RollupResult, rollup_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    try:
+        rollup_key = json.loads(base64.urlsafe_b64decode(rollup_key_b64.encode()).decode())
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid rollup key")
+    overlay_ids = result.hazard_overlay_result_ids_json or []
+    first_overlay_id = overlay_ids[0] if overlay_ids else None
+    query = db.query(Location)
+    if first_overlay_id:
+        query = query.outerjoin(
+            LocationHazardAttribute,
+            and_(
+                LocationHazardAttribute.location_id == Location.id,
+                LocationHazardAttribute.hazard_overlay_result_id == first_overlay_id,
+                LocationHazardAttribute.tenant_id == user.tenant_id,
+            ),
+        )
+    query = query.filter(Location.tenant_id == user.tenant_id, Location.exposure_version_id == result.exposure_version_id)
+    for dim, val in rollup_key.items():
+        if dim == "country":
+            query = query.filter(Location.country == val)
+        elif dim == "state_region":
+            query = query.filter(Location.state_region == val)
+        elif dim == "postal_code":
+            query = query.filter(Location.postal_code == val)
+        elif dim == "lob":
+            query = query.filter(Location.lob == val)
+        elif dim == "product_code":
+            query = query.filter(Location.product_code == val)
+        elif dim == "quality_tier":
+            query = query.filter(Location.quality_tier == val)
+        elif dim == "hazard_band" and first_overlay_id:
+            query = query.filter(LocationHazardAttribute.attributes_json["band"].astext == str(val))
+        elif dim == "hazard_category" and first_overlay_id:
+            query = query.filter(LocationHazardAttribute.attributes_json["hazard_category"].astext == str(val))
+    results = query.order_by(Location.external_location_id.asc()).all()
+    items = []
+    for loc in results:
+        attrs = None
+        if isinstance(loc, tuple):
+            loc_obj = loc[0]
+            attrs_obj = loc[1]
+            attrs = getattr(attrs_obj, "attributes_json", attrs_obj)
+        else:
+            loc_obj = loc
+        if first_overlay_id and attrs is None:
+            attrs = db.execute(
+                select(LocationHazardAttribute.attributes_json).where(
+                    LocationHazardAttribute.location_id == loc_obj.id,
+                    LocationHazardAttribute.hazard_overlay_result_id == first_overlay_id,
+                    LocationHazardAttribute.tenant_id == user.tenant_id,
+                )
+            ).scalar_one_or_none()
+        items.append(
+            {
+                "external_location_id": loc_obj.external_location_id,
+                "tiv": loc_obj.tiv,
+                "country": loc_obj.country,
+                "state_region": loc_obj.state_region,
+                "postal_code": loc_obj.postal_code,
+                "lob": loc_obj.lob,
+                "product_code": loc_obj.product_code,
+                "quality_tier": loc_obj.quality_tier,
+                "hazard_band": (attrs or {}).get("band") if attrs else None,
+                "hazard_category": (attrs or {}).get("hazard_category") if attrs else None,
+            }
+        )
+    return {"items": items}
+
+
+@router.post("/threshold-rules")
+def create_threshold_rule(
+    payload: ThresholdRuleCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    rule = ThresholdRule(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        rule_json=payload.rule_json,
+        severity=payload.severity,
+        active=payload.active,
+        created_by=user.user_id,
+    )
+    db.add(rule)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "threshold_rule_created", {"threshold_rule_id": rule.id})
+    return {"threshold_rule_id": rule.id}
+
+
+@router.get("/threshold-rules")
+def list_threshold_rules(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    rules = db.execute(select(ThresholdRule).where(ThresholdRule.tenant_id == user.tenant_id)).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "name": r.name,
+            "severity": r.severity,
+            "active": r.active,
+            "created_at": r.created_at,
+        }
+        for r in rules
+    ]}
+
+
+@router.post("/breaches/run")
+def run_breach_eval(
+    payload: BreachEvalRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(RollupResult, payload.rollup_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup result not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.BREACH_EVAL,
+        status=RunStatus.QUEUED,
+        input_refs_json={"rollup_result_id": payload.rollup_result_id, "threshold_rule_ids": payload.threshold_rule_ids},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    breach_task.delay(run.id, payload.rollup_result_id, payload.threshold_rule_ids or [], user.tenant_id)
+    emit_audit(db, user.tenant_id, user.user_id, "breach_eval_requested", {"rollup_result_id": payload.rollup_result_id})
+    return {"run_id": run.id}
+
+
+@router.get("/breaches")
+def list_breaches(
+    status_filter: Optional[str] = None,
+    exposure_version_id: Optional[int] = None,
+    threshold_rule_id: Optional[int] = None,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = select(Breach).where(Breach.tenant_id == user.tenant_id)
+    if status_filter:
+        query = query.where(Breach.status == status_filter)
+    if exposure_version_id:
+        query = query.where(Breach.exposure_version_id == exposure_version_id)
+    if threshold_rule_id:
+        query = query.where(Breach.threshold_rule_id == threshold_rule_id)
+    breaches = db.execute(query.order_by(Breach.last_seen_at.desc())).scalars().all()
+    return {"items": [
+        {
+            "id": b.id,
+            "status": b.status,
+            "rollup_result_id": b.rollup_result_id,
+            "threshold_rule_id": b.threshold_rule_id,
+            "metric_name": b.metric_name,
+            "metric_value": b.metric_value,
+            "threshold_value": b.threshold_value,
+            "rollup_key": b.rollup_key_json,
+            "last_seen_at": b.last_seen_at,
+        }
+        for b in breaches
+    ]}
+
+
+@router.patch("/breaches/{breach_id}")
+def update_breach_status(
+    breach_id: int,
+    payload: Dict[str, str],
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    breach = db.get(Breach, breach_id)
+    if not breach or breach.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    new_status = payload.get("status")
+    if new_status not in {"ACKED", "RESOLVED"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
+    now = datetime.utcnow()
+    if new_status == "RESOLVED":
+        breach.resolved_at = now
+    breach.status = new_status
+    breach.last_seen_at = now
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "breach_status_updated", {"breach_id": breach.id, "status": new_status})
+    return {"breach_id": breach.id, "status": breach.status}
 
 
 @router.get("/runs/{run_id}")

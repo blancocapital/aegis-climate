@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
     DateTime,
     Enum,
@@ -34,6 +35,8 @@ class RunType(str, enum.Enum):
     COMMIT = "COMMIT"
     GEOCODE = "GEOCODE"
     OVERLAY = "OVERLAY"
+    ROLLUP = "ROLLUP"
+    BREACH_EVAL = "BREACH_EVAL"
 
 
 class RunStatus(str, enum.Enum):
@@ -271,3 +274,98 @@ class LocationHazardAttribute(Base):
     attributes_json = Column(JSON, nullable=False)
 
     __table_args__ = (Index("ix_location_hazard_attr_tenant", "tenant_id"),)
+
+
+class RollupConfig(Base):
+    __tablename__ = "rollup_config"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    version = Column(Integer, nullable=False)
+    dimensions_json = Column(JSON, nullable=False)
+    filters_json = Column(JSON, nullable=True)
+    measures_json = Column(JSON, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "name", "version", name="uq_rollup_config_version"),
+        Index("ix_rollup_config_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class RollupResult(Base):
+    __tablename__ = "rollup_result"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    rollup_config_id = Column(Integer, ForeignKey("rollup_config.id", ondelete="CASCADE"), nullable=False)
+    hazard_overlay_result_ids_json = Column(JSON, nullable=True)
+    storage_uri = Column(String, nullable=True)
+    checksum = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+
+    __table_args__ = (
+        Index("ix_rollup_result_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class RollupResultItem(Base):
+    __tablename__ = "rollup_result_item"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    rollup_result_id = Column(Integer, ForeignKey("rollup_result.id", ondelete="CASCADE"), nullable=False)
+    rollup_key_json = Column(JSON, nullable=False)
+    rollup_key_hash = Column(String, nullable=False)
+    metrics_json = Column(JSON, nullable=False)
+
+    __table_args__ = (
+        Index("ix_rollup_item_tenant_result", "tenant_id", "rollup_result_id"),
+        UniqueConstraint("tenant_id", "rollup_result_id", "rollup_key_hash", name="uq_rollup_item_unique"),
+    )
+
+
+class ThresholdRule(Base):
+    __tablename__ = "threshold_rule"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    rule_json = Column(JSON, nullable=False)
+    severity = Column(String, nullable=False)
+    active = Column(Boolean, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_threshold_rule_tenant_created", "tenant_id", "created_at"),)
+
+
+class Breach(Base):
+    __tablename__ = "breach"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    rollup_result_id = Column(Integer, ForeignKey("rollup_result.id", ondelete="CASCADE"), nullable=False)
+    threshold_rule_id = Column(Integer, ForeignKey("threshold_rule.id", ondelete="CASCADE"), nullable=False)
+    rollup_key_json = Column(JSON, nullable=False)
+    rollup_key_hash = Column(String, nullable=False)
+    metric_name = Column(String, nullable=False)
+    metric_value = Column(Float, nullable=False)
+    threshold_value = Column(Float, nullable=False)
+    status = Column(String, nullable=False)
+    first_seen_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    last_eval_run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+
+    __table_args__ = (
+        Index("ix_breach_tenant_status_last_seen", "tenant_id", "status", "last_seen_at"),
+        UniqueConstraint(
+            "tenant_id", "threshold_rule_id", "exposure_version_id", "rollup_key_hash", name="uq_breach_unique"
+        ),
+    )

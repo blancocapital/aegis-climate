@@ -1,6 +1,8 @@
 import json
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
+
+from datetime import datetime
 
 from celery import Celery
 from sqlalchemy import select
@@ -18,15 +20,23 @@ from app.models import (
     ValidationResult,
     ExposureVersion,
     Tenant,
+    HazardDataset,
     HazardDatasetVersion,
     HazardFeaturePolygon,
     HazardOverlayResult,
     LocationHazardAttribute,
+    RollupConfig,
+    RollupResult,
+    RollupResultItem,
+    ThresholdRule,
+    Breach,
 )
 from app.services.validation import read_csv_bytes, validate_rows
 from app.services.commit import canonicalize_rows, to_location_dict
 from app.services.geocode import geocode_address
 from app.services.quality import quality_scores
+from app.services.rollup import compute_rollup
+from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.storage.s3 import compute_checksum, get_object, put_object
 
 settings = get_settings()
@@ -72,6 +82,215 @@ def validate_upload(run_id: int, upload_id: str, tenant_id: str):
         run.code_version = settings.code_version
         session.commit()
         return {"validation_result_id": validation.id, "run_id": run.id}
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def rollup_execute(
+    run_id: int,
+    rollup_result_id: int,
+    exposure_version_id: int,
+    rollup_config_id: int,
+    hazard_overlay_result_ids: List[int],
+    tenant_id: str,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    rollup_result = session.get(RollupResult, rollup_result_id)
+    if not run or not rollup_result or run.tenant_id != tenant_id or rollup_result.tenant_id != tenant_id:
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        config = session.get(RollupConfig, rollup_config_id)
+        if not config or config.tenant_id != tenant_id:
+            raise ValueError("rollup config not found")
+        exposure_version = session.get(ExposureVersion, exposure_version_id)
+        if not exposure_version or exposure_version.tenant_id != tenant_id:
+            raise ValueError("exposure version not found")
+
+        overlay_ids = hazard_overlay_result_ids or []
+        first_overlay_id = overlay_ids[0] if overlay_ids else None
+        attr_map = {}
+        if first_overlay_id:
+            attrs = session.query(LocationHazardAttribute).filter(
+                LocationHazardAttribute.tenant_id == tenant_id,
+                LocationHazardAttribute.hazard_overlay_result_id == first_overlay_id,
+            ).all()
+            attr_map = {a.location_id: a.attributes_json or {} for a in attrs}
+
+        locations = session.query(Location).filter(
+            Location.tenant_id == tenant_id,
+            Location.exposure_version_id == exposure_version_id,
+        ).all()
+        enriched = []
+        for loc in locations:
+            attrs = attr_map.get(loc.id, {})
+            enriched.append(
+                {
+                    "external_location_id": loc.external_location_id,
+                    "country": loc.country,
+                    "state_region": loc.state_region,
+                    "postal_code": loc.postal_code,
+                    "lob": loc.lob,
+                    "product_code": loc.product_code,
+                    "quality_tier": loc.quality_tier,
+                    "hazard_band": attrs.get("band"),
+                    "hazard_category": attrs.get("hazard_category"),
+                    "tiv": loc.tiv,
+                    "limit": loc.limit,
+                    "premium": loc.premium,
+                }
+            )
+
+        rows, checksum = compute_rollup(enriched, config.dimensions_json, config.measures_json, config.filters_json)
+        result_items = []
+        for row in rows:
+            result_items.append(
+                RollupResultItem(
+                    tenant_id=tenant_id,
+                    rollup_result_id=rollup_result_id,
+                    rollup_key_json=row["rollup_key_json"],
+                    rollup_key_hash=row["rollup_key_hash"],
+                    metrics_json=row["metrics_json"],
+                )
+            )
+        if result_items:
+            session.bulk_save_objects(result_items)
+        rollup_result.checksum = checksum
+        rollup_result.hazard_overlay_result_ids_json = overlay_ids
+        session.commit()
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {"rollup_result_id": rollup_result_id}
+        run.artifact_checksums_json = {"rollup_result_checksum": checksum}
+        run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def breach_evaluate(
+    run_id: int,
+    rollup_result_id: int,
+    threshold_rule_ids: List[int] | None,
+    tenant_id: str,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    rollup_result = session.get(RollupResult, rollup_result_id)
+    if not run or not rollup_result or run.tenant_id != tenant_id or rollup_result.tenant_id != tenant_id:
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        exposure_version = session.get(ExposureVersion, rollup_result.exposure_version_id)
+        if not exposure_version or exposure_version.tenant_id != tenant_id:
+            raise ValueError("exposure version not found")
+        query = select(ThresholdRule).where(ThresholdRule.tenant_id == tenant_id)
+        if threshold_rule_ids:
+            query = query.where(ThresholdRule.id.in_(threshold_rule_ids))
+        rules = session.execute(query).scalars().all()
+        rules = [r for r in rules if r.active]
+
+        items = session.query(RollupResultItem).filter(
+            RollupResultItem.tenant_id == tenant_id,
+            RollupResultItem.rollup_result_id == rollup_result_id,
+        ).all()
+        rows = [
+            {
+                "rollup_key_json": item.rollup_key_json,
+                "rollup_key_hash": item.rollup_key_hash,
+                "metrics_json": item.metrics_json,
+            }
+            for item in items
+        ]
+        now = datetime.utcnow()
+        opened = 0
+        resolved = 0
+        for rule in rules:
+            matches = evaluate_rule_on_rollup_rows(rows, rule.rule_json)
+            matched_hashes = set(m["rollup_key_hash"] for m in matches)
+            for match in matches:
+                breach = session.execute(
+                    select(Breach).where(
+                        Breach.tenant_id == tenant_id,
+                        Breach.threshold_rule_id == rule.id,
+                        Breach.exposure_version_id == exposure_version.id,
+                        Breach.rollup_key_hash == match["rollup_key_hash"],
+                    )
+                ).scalar_one_or_none()
+                if not breach:
+                    breach = Breach(
+                        tenant_id=tenant_id,
+                        exposure_version_id=exposure_version.id,
+                        rollup_result_id=rollup_result_id,
+                        threshold_rule_id=rule.id,
+                        rollup_key_json=match["rollup_key_json"],
+                        rollup_key_hash=match["rollup_key_hash"],
+                        metric_name=rule.rule_json.get("metric"),
+                        metric_value=match["metric_value"],
+                        threshold_value=rule.rule_json.get("value"),
+                        status="OPEN",
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        resolved_at=None,
+                        last_eval_run_id=run_id,
+                    )
+                    session.add(breach)
+                    opened += 1
+                else:
+                    breach.metric_value = match["metric_value"]
+                    breach.threshold_value = rule.rule_json.get("value")
+                    breach.last_seen_at = now
+                    breach.rollup_result_id = rollup_result_id
+                    breach.last_eval_run_id = run_id
+                    if breach.status == "RESOLVED":
+                        breach.status = "OPEN"
+                        breach.resolved_at = None
+                        opened += 1
+                session.commit()
+            stale_conditions = [
+                Breach.tenant_id == tenant_id,
+                Breach.threshold_rule_id == rule.id,
+                Breach.exposure_version_id == exposure_version.id,
+            ]
+            if matched_hashes:
+                stale_conditions.append(~Breach.rollup_key_hash.in_(matched_hashes))
+            stale_breaches = session.execute(select(Breach).where(*stale_conditions)).scalars().all()
+            for breach in stale_breaches:
+                if breach.status in ("OPEN", "ACKED"):
+                    breach.status = "RESOLVED"
+                    breach.resolved_at = now
+                    breach.last_eval_run_id = run_id
+                    breach.last_seen_at = now
+                    breach.rollup_result_id = rollup_result_id
+                    resolved += 1
+            session.commit()
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {
+            "rollup_result_id": rollup_result_id,
+            "breaches_open": opened,
+            "breaches_resolved": resolved,
+            "rules_evaluated": len(rules),
+        }
+        run.code_version = settings.code_version
+        session.commit()
     except Exception:
         run.status = RunStatus.FAILED
         run.completed_at = datetime.utcnow()
@@ -197,10 +416,18 @@ def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str):
 
 
 @celery_app.task
-def overlay_hazard(run_id: int, exposure_version_id: int, hazard_dataset_version_id: int, tenant_id: str, params: Dict | None = None):
+def overlay_hazard(
+    run_id: int,
+    overlay_result_id: int,
+    exposure_version_id: int,
+    hazard_dataset_version_id: int,
+    tenant_id: str,
+    params: Dict | None = None,
+):
     session = SessionLocal()
     run = session.get(Run, run_id)
-    if not run or run.tenant_id != tenant_id:
+    overlay_result = session.get(HazardOverlayResult, overlay_result_id)
+    if not run or not overlay_result or run.tenant_id != tenant_id or overlay_result.tenant_id != tenant_id:
         return
     try:
         run.status = RunStatus.RUNNING
@@ -212,16 +439,7 @@ def overlay_hazard(run_id: int, exposure_version_id: int, hazard_dataset_version
         hdv = session.get(HazardDatasetVersion, hazard_dataset_version_id)
         if not hdv or hdv.tenant_id != tenant_id:
             raise ValueError("hazard dataset version not found")
-        overlay_result = HazardOverlayResult(
-            tenant_id=tenant_id,
-            exposure_version_id=exposure_version_id,
-            hazard_dataset_version_id=hazard_dataset_version_id,
-            method="POSTGIS_SPATIAL_JOIN",
-            params_json=params or {},
-            run_id=run_id,
-        )
-        session.add(overlay_result)
-        session.commit()
+        hazard_dataset = session.get(HazardDataset, hdv.hazard_dataset_id)
         locations = session.query(Location).filter(
             Location.tenant_id == tenant_id,
             Location.exposure_version_id == exposure_version_id,
@@ -245,11 +463,14 @@ def overlay_hazard(run_id: int, exposure_version_id: int, hazard_dataset_version
                 continue
             props = feature.properties_json or {}
             attributes = {
-                "hazard_category": props.get("peril") or props.get("hazard") or "",
+                "hazard_category": props.get("hazard_category")
+                or props.get("peril")
+                or props.get("hazard")
+                or hazard_dataset.peril if hazard_dataset else None,
                 "band": props.get("band") or props.get("Band"),
                 "percentile": props.get("percentile"),
                 "score": props.get("score"),
-                "source": f"{hdv.hazard_dataset_id}:{hdv.version_label}",
+                "source": f"{hazard_dataset.name if hazard_dataset else hdv.hazard_dataset_id}:{hdv.version_label}",
                 "method": "POSTGIS_SPATIAL_JOIN",
                 "raw": props,
             }
