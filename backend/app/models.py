@@ -151,6 +151,37 @@ class MappingTemplate(Base):
     )
 
 
+class PolicyPack(Base):
+    __tablename__ = "policy_pack"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_policy_pack_tenant_created", "tenant_id", "created_at"),)
+
+
+class PolicyPackVersion(Base):
+    __tablename__ = "policy_pack_version"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    policy_pack_id = Column(Integer, ForeignKey("policy_pack.id", ondelete="CASCADE"), nullable=False)
+    version_label = Column(String, nullable=False)
+    scoring_config_json = Column(JSON, nullable=True)
+    underwriting_policy_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "policy_pack_id", "version_label", name="uq_policy_pack_version"),
+        Index("ix_policy_pack_version_tenant_pack_created", "tenant_id", "policy_pack_id", "created_at"),
+    )
+
+
 class ValidationResult(Base):
     __tablename__ = "validation_result"
 
@@ -346,6 +377,8 @@ class ResilienceScoreResult(Base):
     hazard_dataset_version_ids_json = Column(JSON, nullable=True)
     hazard_versions_json = Column(JSON, nullable=True)
     scoring_config_json = Column(JSON, nullable=True)
+    policy_pack_version_id = Column(Integer, ForeignKey("policy_pack_version.id", ondelete="SET NULL"), nullable=True)
+    policy_used_json = Column(JSON, nullable=True)
     request_fingerprint = Column(String, nullable=False)
     request_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -353,6 +386,7 @@ class ResilienceScoreResult(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "request_fingerprint", name="uq_resilience_score_request"),
         Index("ix_resilience_score_result_tenant_created", "tenant_id", "created_at"),
+        Index("ix_resilience_score_result_policy", "tenant_id", "policy_pack_version_id"),
     )
 
 

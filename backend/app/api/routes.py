@@ -51,6 +51,8 @@ from app.models import (
     ResilienceScoreResult,
     ResilienceScoreItem,
     PropertyProfile,
+    PolicyPack,
+    PolicyPackVersion,
 )
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
@@ -62,6 +64,7 @@ from app.services.resilience_export import iter_resilience_export_rows
 from app.services.resilience import DEFAULT_WEIGHTS, SCORING_VERSION, compute_resilience_score
 from app.services.structural import merge_structural, normalize_structural
 from app.services.explainability import build_explainability
+from app.services.policy_resolver import merge_policy_overrides, resolve_policy_version
 from app.services.property_enrichment import (
     determine_enrich_mode,
     normalize_address,
@@ -186,6 +189,18 @@ class MappingRequest(BaseModel):
     mapping_json: Dict[str, str]
 
 
+class PolicyPackCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    is_active: bool = True
+
+
+class PolicyPackVersionCreate(BaseModel):
+    version_label: str
+    scoring_config_json: Optional[Dict[str, Any]] = None
+    underwriting_policy_json: Optional[Dict[str, Any]] = None
+
+
 class HazardDatasetCreate(BaseModel):
     name: str
     peril: str
@@ -223,6 +238,7 @@ class ResilienceScoreRequest(BaseModel):
     best_effort: bool = True
     include_decision: bool = True
     underwriting_policy: Optional[Dict[str, Any]] = None
+    policy_pack_version_id: Optional[int] = None
 
 
 class LocationStructuralRequest(BaseModel):
@@ -250,6 +266,7 @@ class ResilienceScoreBatchRequest(BaseModel):
     hazard_dataset_version_ids: Optional[List[int]] = None
     config: Optional[Dict[str, Any]] = None
     force: bool = False
+    policy_pack_version_id: Optional[int] = None
 
 
 class DriftRequest(BaseModel):
@@ -381,6 +398,125 @@ def attach_mapping(
     db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "mapping_attached", {"upload_id": upload_id})
     return {"mapping_template_id": template.id, "name": template.name, "version": template.version}
+
+
+@router.post("/policy-packs")
+def create_policy_pack(
+    payload: PolicyPackCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    pack = PolicyPack(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        description=payload.description,
+        is_active=payload.is_active,
+    )
+    db.add(pack)
+    db.commit()
+    return {
+        "id": pack.id,
+        "name": pack.name,
+        "description": pack.description,
+        "is_active": pack.is_active,
+        "created_at": pack.created_at.isoformat(),
+    }
+
+
+@router.post("/policy-packs/{policy_pack_id}/versions")
+def create_policy_pack_version(
+    policy_pack_id: int,
+    payload: PolicyPackVersionCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    pack = db.get(PolicyPack, policy_pack_id)
+    if not pack or pack.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy pack not found")
+    version = PolicyPackVersion(
+        tenant_id=user.tenant_id,
+        policy_pack_id=policy_pack_id,
+        version_label=payload.version_label,
+        scoring_config_json=payload.scoring_config_json,
+        underwriting_policy_json=payload.underwriting_policy_json,
+    )
+    db.add(version)
+    db.commit()
+    return {
+        "id": version.id,
+        "policy_pack_id": policy_pack_id,
+        "version_label": version.version_label,
+        "created_at": version.created_at.isoformat(),
+    }
+
+
+@router.get("/policy-packs")
+def list_policy_packs(
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    packs = db.execute(
+        select(PolicyPack)
+        .where(PolicyPack.tenant_id == user.tenant_id)
+        .order_by(PolicyPack.created_at.desc())
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": pack.id,
+                "name": pack.name,
+                "description": pack.description,
+                "is_active": pack.is_active,
+                "created_at": pack.created_at.isoformat(),
+                "updated_at": pack.updated_at.isoformat() if pack.updated_at else None,
+            }
+            for pack in packs
+        ]
+    }
+
+
+@router.get("/policy-packs/{policy_pack_id}/versions")
+def list_policy_pack_versions(
+    policy_pack_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    pack = db.get(PolicyPack, policy_pack_id)
+    if not pack or pack.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy pack not found")
+    versions = db.execute(
+        select(PolicyPackVersion)
+        .where(
+            PolicyPackVersion.tenant_id == user.tenant_id,
+            PolicyPackVersion.policy_pack_id == policy_pack_id,
+        )
+        .order_by(PolicyPackVersion.created_at.desc())
+    ).scalars().all()
+    return {
+        "items": [
+            {
+                "id": version.id,
+                "policy_pack_id": version.policy_pack_id,
+                "version_label": version.version_label,
+                "created_at": version.created_at.isoformat(),
+                "scoring_config_json": version.scoring_config_json,
+                "underwriting_policy_json": version.underwriting_policy_json,
+            }
+            for version in versions
+        ]
+    }
 
 
 @router.post("/uploads/{upload_id}/validate")
@@ -1287,6 +1423,12 @@ def score_resilience(
     enrichment_errors: List[Dict[str, Any]] = []
     enrichment_failed = False
     enrichment_attempted = False
+    try:
+        scoring_config, _, policy_meta = resolve_policy_version(
+            db, user.tenant_id, payload.policy_pack_version_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     if payload.location_id is not None:
         location = db.get(Location, payload.location_id)
@@ -1565,7 +1707,7 @@ def score_resilience(
             )
             merge_worst_in_peril(hazards, entry)
 
-    result = compute_resilience_score(hazards, structural_used, None)
+    result = compute_resilience_score(hazards, structural_used, scoring_config)
     hazard_response = {
         peril: {"score": data.get("score"), "band": data.get("band"), "source": data.get("source")}
         for peril, data in hazards.items()
@@ -1609,6 +1751,7 @@ def score_resilience(
         "hazard_versions_used": hazard_versions_used,
         "scoring_version": SCORING_VERSION,
         "code_version": settings.code_version,
+        "policy_used": policy_meta,
         "property_profile_id": property_profile_id,
         "property_profile_updated_at": property_profile_updated_at,
         "property_profile": summarize_property_profile(property_profile),
@@ -1627,6 +1770,13 @@ def underwriting_packet(
     response = score_resilience(payload, user, db)
     if isinstance(response, JSONResponse):
         return response
+    try:
+        _, underwriting_policy, policy_meta = resolve_policy_version(
+            db, user.tenant_id, payload.policy_pack_version_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    underwriting_policy = merge_policy_overrides(underwriting_policy, payload.underwriting_policy or {})
     property_summary = response.get("property_profile")
     if not property_summary:
         property_summary = {
@@ -1640,7 +1790,7 @@ def underwriting_packet(
             response.get("hazards") or {},
             response.get("structural") or {},
             response.get("data_quality") or {},
-            policy=payload.underwriting_policy,
+            policy=underwriting_policy,
         )
     explainability = build_explainability(
         response.get("result") or {},
@@ -1661,6 +1811,7 @@ def underwriting_packet(
         "quality": response.get("data_quality"),
         "decision": decision_payload,
         "explainability": explainability,
+        "policy_used": policy_meta,
     }
 
 
@@ -1698,6 +1849,8 @@ def list_resilience_scores(
                 "scoring_version": result.scoring_version,
                 "code_version": result.code_version,
                 "hazard_versions_used": result.hazard_versions_json,
+                "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+                "policy_pack_version_id": result.policy_pack_version_id,
                 "status": status_value,
                 "run_id": result.run_id,
             }
@@ -1749,22 +1902,31 @@ def create_resilience_scores(
 
     version_ids = sorted(version_ids)
     hazard_versions_used = build_hazard_versions(db, user.tenant_id, version_ids)
+    try:
+        scoring_config, _, policy_meta = resolve_policy_version(
+            db, user.tenant_id, payload.policy_pack_version_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    scoring_config_used = merge_policy_overrides(scoring_config, payload.config or {})
 
     request_payload = {
         "tenant_id": user.tenant_id,
         "exposure_version_id": payload.exposure_version_id,
         "hazard_dataset_version_ids": version_ids,
-        "config": payload.config or {},
+        "config": scoring_config_used,
         "scoring_version": SCORING_VERSION,
         "code_version": settings.code_version,
+        "policy_pack_version_id": payload.policy_pack_version_id,
     }
     base_fingerprint = fingerprint_resilience_scores_request(
         user.tenant_id,
         payload.exposure_version_id,
         version_ids,
-        payload.config,
+        scoring_config_used,
         SCORING_VERSION,
         settings.code_version,
+        payload.policy_pack_version_id,
     )
     request_json = dict(request_payload)
     now = datetime.utcnow()
@@ -1816,8 +1978,9 @@ def create_resilience_scores(
         input_refs_json={
             "exposure_version_id": payload.exposure_version_id,
             "hazard_dataset_version_ids": version_ids,
+            "policy_pack_version_id": payload.policy_pack_version_id,
         },
-        config_refs_json={"config": payload.config or {}},
+        config_refs_json={"config": scoring_config_used, "policy_pack_version_id": payload.policy_pack_version_id},
         created_by=user.user_id,
         code_version=settings.code_version,
     )
@@ -1833,7 +1996,9 @@ def create_resilience_scores(
         code_version=settings.code_version,
         hazard_dataset_version_ids_json=version_ids,
         hazard_versions_json=hazard_versions_used,
-        scoring_config_json=payload.config,
+        scoring_config_json=scoring_config_used,
+        policy_pack_version_id=payload.policy_pack_version_id,
+        policy_used_json=policy_meta,
         request_fingerprint=request_fingerprint,
         request_json=request_json,
     )
@@ -1863,7 +2028,7 @@ def create_resilience_scores(
         payload.exposure_version_id,
         version_ids,
         user.tenant_id,
-        payload.config,
+        scoring_config_used,
         run.request_id,
     )
     run.celery_task_id = async_result.id
@@ -1949,6 +2114,8 @@ def get_resilience_score_summary(
         "scoring_version": result.scoring_version,
         "code_version": result.code_version,
         "hazard_versions_used": result.hazard_versions_json,
+        "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+        "policy_pack_version_id": result.policy_pack_version_id,
         "buckets": {
             "0_19": int(summary.bucket_0_19 or 0),
             "20_39": int(summary.bucket_20_39 or 0),
@@ -2139,6 +2306,8 @@ def disclosure_resilience_scores(
             "scoring_version": result.scoring_version,
             "code_version": result.code_version,
             "hazard_versions_used": result.hazard_versions_json,
+            "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+            "policy_pack_version_id": result.policy_pack_version_id,
             "peril_coverage": output_refs.get("peril_coverage"),
             "disclosure_percentages": {
                 "bucket_percent_locations": percent_locations,
@@ -2182,6 +2351,8 @@ def disclosure_resilience_scores(
         "scoring_version": result.scoring_version,
         "code_version": result.code_version,
         "hazard_versions_used": result.hazard_versions_json,
+        "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+        "policy_pack_version_id": result.policy_pack_version_id,
         "peril_coverage": output_refs.get("peril_coverage"),
         "top_groups": groups,
     }

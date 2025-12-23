@@ -24,6 +24,8 @@ def test_export_header_and_json_serialization():
         "hazards_json": {"wind": {"score": 0.2}},
         "structural_json": {"roof_material": "metal"},
         "input_structural_json": {"roof_material": "metal"},
+        "policy_pack_version_id": 5,
+        "policy_used_json": {"policy_pack_version_id": 5, "version_label": "v1"},
     }
     csv_text = rows_to_csv([row])
     reader = csv.reader(io.StringIO(csv_text))
@@ -35,3 +37,6 @@ def test_export_header_and_json_serialization():
     assert data[col_index["hazards_json"]] == json.dumps({"wind": {"score": 0.2}}, separators=(",", ":"), sort_keys=True)
     assert data[col_index["structural_json"]] == json.dumps({"roof_material": "metal"}, separators=(",", ":"), sort_keys=True)
     assert data[col_index["input_structural_json"]] == json.dumps({"roof_material": "metal"}, separators=(",", ":"), sort_keys=True)
+    assert data[col_index["policy_used_json"]] == json.dumps(
+        {"policy_pack_version_id": 5, "version_label": "v1"}, separators=(",", ":"), sort_keys=True
+    )

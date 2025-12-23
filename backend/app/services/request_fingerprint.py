@@ -14,6 +14,7 @@ def fingerprint_resilience_scores_request(
     config: Optional[Dict[str, Any]],
     scoring_version: str,
     code_version: Optional[str],
+    policy_pack_version_id: Optional[int],
 ) -> str:
     hazard_version_ids = sorted(hazard_version_ids or [])
     payload = {
@@ -23,6 +24,7 @@ def fingerprint_resilience_scores_request(
         "config": config or {},
         "scoring_version": scoring_version,
         "code_version": code_version,
+        "policy_pack_version_id": policy_pack_version_id if policy_pack_version_id is not None else "default",
     }
     payload_str = canonical_json(payload)
     return hashlib.sha256(payload_str.encode()).hexdigest()

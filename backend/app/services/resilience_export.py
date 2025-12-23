@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import Location, ResilienceScoreItem
+from app.models import Location, ResilienceScoreItem, ResilienceScoreResult
 
 CSV_COLUMNS = [
     "location_id",
@@ -26,6 +26,8 @@ CSV_COLUMNS = [
     "hazards_json",
     "structural_json",
     "input_structural_json",
+    "policy_pack_version_id",
+    "policy_used_json",
 ]
 
 
@@ -62,6 +64,8 @@ def serialize_export_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "hazards_json": _serialize_json(row.get("hazards_json")),
         "structural_json": _serialize_json(row.get("structural_json")),
         "input_structural_json": _serialize_json(row.get("input_structural_json")),
+        "policy_pack_version_id": row.get("policy_pack_version_id"),
+        "policy_used_json": _serialize_json(row.get("policy_used_json")),
     }
 
 
@@ -85,8 +89,9 @@ def iter_resilience_export_rows(
     first = True
     while True:
         rows = db.execute(
-            select(ResilienceScoreItem, Location)
+            select(ResilienceScoreItem, Location, ResilienceScoreResult)
             .join(Location, ResilienceScoreItem.location_id == Location.id)
+            .join(ResilienceScoreResult, ResilienceScoreItem.resilience_score_result_id == ResilienceScoreResult.id)
             .where(
                 ResilienceScoreItem.tenant_id == tenant_id,
                 ResilienceScoreItem.resilience_score_result_id == result_id,
@@ -98,7 +103,7 @@ def iter_resilience_export_rows(
         if not rows:
             break
         export_rows: List[Dict[str, Any]] = []
-        for item, location in rows:
+        for item, location, result in rows:
             warnings = []
             input_structural = None
             if isinstance(item.result_json, dict):
@@ -123,6 +128,8 @@ def iter_resilience_export_rows(
                     "hazards_json": item.hazards_json,
                     "structural_json": location.structural_json,
                     "input_structural_json": input_structural,
+                    "policy_pack_version_id": result.policy_pack_version_id,
+                    "policy_used_json": result.policy_used_json,
                 }
             )
             start_after_id = item.id

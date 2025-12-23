@@ -15,6 +15,11 @@ ROOF_MATERIAL_BONUS = {
     "asphalt_shingle": 0,
     "wood_shake": -5,
 }
+DEFAULT_CONFIG = {
+    "weights": dict(DEFAULT_WEIGHTS),
+    "unknown_hazard_score": DEFAULT_UNKNOWN_HAZARD_SCORE,
+    "roof_material_bonus": dict(ROOF_MATERIAL_BONUS),
+}
 
 
 def clamp(value: float, minimum: float = 0.0, maximum: float = 1.0) -> float:
@@ -46,7 +51,12 @@ def compute_resilience_score(
 
     roof_material = structural.get("roof_material")
     roof_key = roof_material.strip().lower() if isinstance(roof_material, str) else None
-    roof_bonus = ROOF_MATERIAL_BONUS.get(roof_key, 0)
+    roof_bonus_map = dict(ROOF_MATERIAL_BONUS)
+    if isinstance(config.get("roof_material_bonus"), dict):
+        for key, value in config["roof_material_bonus"].items():
+            if isinstance(key, str):
+                roof_bonus_map[key.lower()] = value
+    roof_bonus = roof_bonus_map.get(roof_key, 0)
 
     elevation_m = _coerce_float(structural.get("elevation_m"))
     vegetation_proximity_m = _coerce_float(structural.get("vegetation_proximity_m"))
