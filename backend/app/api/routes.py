@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 import jwt
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status, Header
-from sqlalchemy import func, select, or_, and_
+from sqlalchemy import case, func, select, or_, and_
 from sqlalchemy.orm import Session
 
 from app.core.auth import TokenData, create_access_token, require_role, verify_password
@@ -43,6 +43,8 @@ from app.models import (
     RollupResultItem,
     ThresholdRule,
     Breach,
+    ResilienceScoreResult,
+    ResilienceScoreItem,
 )
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
@@ -52,6 +54,7 @@ from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
 from app.jobs.celery_app import breach_evaluate as breach_task
+from app.jobs.celery_app import compute_resilience_scores as resilience_score_task
 
 router = APIRouter()
 settings = get_settings()
@@ -119,6 +122,12 @@ class ResilienceScoreRequest(BaseModel):
     country: Optional[str] = None
     structural: Optional[ResilienceStructural] = None
     hazard_dataset_version_ids: Optional[List[int]] = None
+
+
+class ResilienceScoreBatchRequest(BaseModel):
+    exposure_version_id: int
+    hazard_dataset_version_ids: Optional[List[int]] = None
+    config: Optional[Dict[str, Any]] = None
 
 
 class DriftRequest(BaseModel):
@@ -804,6 +813,211 @@ def score_resilience(
         "hazards": hazard_response,
         "result": result,
     }
+
+
+@router.post("/resilience-scores")
+def create_resilience_scores(
+    payload: ResilienceScoreBatchRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    exposure_version = db.get(ExposureVersion, payload.exposure_version_id)
+    if not exposure_version or exposure_version.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+
+    version_ids: List[int] = []
+    if payload.hazard_dataset_version_ids is not None:
+        requested_ids = payload.hazard_dataset_version_ids
+        if requested_ids:
+            version_ids = db.execute(
+                select(HazardDatasetVersion.id).where(
+                    HazardDatasetVersion.tenant_id == user.tenant_id,
+                    HazardDatasetVersion.id.in_(requested_ids),
+                )
+            ).scalars().all()
+            if not version_ids:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hazard dataset versions not found")
+    else:
+        datasets = db.execute(
+            select(HazardDataset).where(HazardDataset.tenant_id == user.tenant_id)
+        ).scalars().all()
+        for dataset in datasets:
+            latest = db.execute(
+                select(HazardDatasetVersion.id)
+                .where(
+                    HazardDatasetVersion.tenant_id == user.tenant_id,
+                    HazardDatasetVersion.hazard_dataset_id == dataset.id,
+                )
+                .order_by(
+                    HazardDatasetVersion.effective_date.desc().nullslast(),
+                    HazardDatasetVersion.created_at.desc(),
+                )
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest:
+                version_ids.append(latest)
+
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.RESILIENCE_SCORE,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "exposure_version_id": payload.exposure_version_id,
+            "hazard_dataset_version_ids": version_ids,
+        },
+        config_refs_json={"config": payload.config or {}},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+
+    result = ResilienceScoreResult(
+        tenant_id=user.tenant_id,
+        exposure_version_id=payload.exposure_version_id,
+        run_id=run.id,
+        hazard_dataset_version_ids_json=version_ids,
+        scoring_config_json=payload.config,
+    )
+    db.add(result)
+    db.commit()
+
+    resilience_score_task.delay(
+        run.id,
+        result.id,
+        payload.exposure_version_id,
+        version_ids,
+        user.tenant_id,
+        payload.config,
+    )
+    emit_audit(db, user.tenant_id, user.user_id, "resilience_scores_requested", {"resilience_score_result_id": result.id})
+    return {"resilience_score_result_id": result.id, "run_id": run.id}
+
+
+@router.get("/resilience-scores/{resilience_score_result_id}/status")
+def get_resilience_score_status(
+    resilience_score_result_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(ResilienceScoreResult, resilience_score_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    run = db.get(Run, result.run_id) if result.run_id else None
+    status_value = run.status.value if run and hasattr(run.status, "value") else (run.status if run else "PENDING")
+    return {"resilience_score_result_id": result.id, "status": status_value, "run_id": result.run_id}
+
+
+@router.get("/resilience-scores/{resilience_score_result_id}/summary")
+def get_resilience_score_summary(
+    resilience_score_result_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(ResilienceScoreResult, resilience_score_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    summary = db.execute(
+        select(
+            func.count(ResilienceScoreItem.id).label("count"),
+            func.avg(ResilienceScoreItem.resilience_score).label("avg"),
+            func.min(ResilienceScoreItem.resilience_score).label("min"),
+            func.max(ResilienceScoreItem.resilience_score).label("max"),
+            func.sum(case((ResilienceScoreItem.resilience_score <= 19, 1), else_=0)).label("bucket_0_19"),
+            func.sum(case((ResilienceScoreItem.resilience_score.between(20, 39), 1), else_=0)).label("bucket_20_39"),
+            func.sum(case((ResilienceScoreItem.resilience_score.between(40, 59), 1), else_=0)).label("bucket_40_59"),
+            func.sum(case((ResilienceScoreItem.resilience_score.between(60, 79), 1), else_=0)).label("bucket_60_79"),
+            func.sum(case((ResilienceScoreItem.resilience_score >= 80, 1), else_=0)).label("bucket_80_100"),
+        )
+        .where(
+            ResilienceScoreItem.tenant_id == user.tenant_id,
+            ResilienceScoreItem.resilience_score_result_id == result.id,
+        )
+    ).one()
+
+    run = db.get(Run, result.run_id) if result.run_id else None
+    output_refs = run.output_refs_json if run and run.output_refs_json else {}
+
+    return {
+        "resilience_score_result_id": result.id,
+        "count": int(summary.count or 0),
+        "avg": float(summary.avg) if summary.avg is not None else None,
+        "min": int(summary.min) if summary.min is not None else None,
+        "max": int(summary.max) if summary.max is not None else None,
+        "buckets": {
+            "0_19": int(summary.bucket_0_19 or 0),
+            "20_39": int(summary.bucket_20_39 or 0),
+            "40_59": int(summary.bucket_40_59 or 0),
+            "60_79": int(summary.bucket_60_79 or 0),
+            "80_100": int(summary.bucket_80_100 or 0),
+        },
+        "scored": output_refs.get("scored"),
+        "skipped_missing_coords": output_refs.get("skipped_missing_coords"),
+    }
+
+
+@router.get("/resilience-scores/{resilience_score_result_id}/items")
+def list_resilience_score_items(
+    resilience_score_result_id: int,
+    limit: int = 100,
+    offset: int = 0,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(ResilienceScoreResult, resilience_score_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    limit = min(max(limit, 1), 500)
+    offset = max(offset, 0)
+
+    rows = db.execute(
+        select(ResilienceScoreItem, Location.external_location_id)
+        .join(Location, ResilienceScoreItem.location_id == Location.id)
+        .where(
+            ResilienceScoreItem.tenant_id == user.tenant_id,
+            ResilienceScoreItem.resilience_score_result_id == result.id,
+        )
+        .order_by(ResilienceScoreItem.id.asc())
+        .limit(limit)
+        .offset(offset)
+    ).all()
+
+    items = []
+    for item, external_location_id in rows:
+        warnings = []
+        if isinstance(item.result_json, dict):
+            warnings = item.result_json.get("warnings") or []
+        items.append(
+            {
+                "location_id": item.location_id,
+                "external_location_id": external_location_id,
+                "resilience_score": item.resilience_score,
+                "risk_score": item.risk_score,
+                "warnings": warnings,
+            }
+        )
+
+    return {"items": items, "limit": limit, "offset": offset}
 
 
 @router.post("/hazard-overlays")

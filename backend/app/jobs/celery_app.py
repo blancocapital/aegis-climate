@@ -1,6 +1,6 @@
 import json
 from datetime import datetime
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from datetime import datetime
 
@@ -22,6 +22,8 @@ from app.models import (
     HazardOverlayResult,
     Location,
     LocationHazardAttribute,
+    ResilienceScoreItem,
+    ResilienceScoreResult,
     MappingTemplate,
     RollupConfig,
     RollupResult,
@@ -38,6 +40,7 @@ from app.services.commit import canonicalize_rows, to_location_dict
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.quality import quality_scores
+from app.services.resilience import compute_resilience_score
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.services.drift import COMPARE_FIELDS, compare_exposures
@@ -530,6 +533,115 @@ def overlay_hazard(
                 "locations": len(locations),
                 "attributes_created": len(saved_attrs),
             },
+        }
+        run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def compute_resilience_scores(
+    run_id: int,
+    score_result_id: int,
+    exposure_version_id: int,
+    hazard_dataset_version_ids: List[int],
+    tenant_id: str,
+    config: Optional[Dict] = None,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    score_result = session.get(ResilienceScoreResult, score_result_id)
+    if (
+        not run
+        or not score_result
+        or run.tenant_id != tenant_id
+        or score_result.tenant_id != tenant_id
+    ):
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        locations = session.query(Location).filter(
+            Location.tenant_id == tenant_id,
+            Location.exposure_version_id == exposure_version_id,
+        ).all()
+        scored = 0
+        skipped_missing_coords = 0
+        batch_size = 1000
+        batch: List[ResilienceScoreItem] = []
+        version_ids = hazard_dataset_version_ids or []
+
+        for loc in locations:
+            if loc.latitude is None or loc.longitude is None:
+                skipped_missing_coords += 1
+                continue
+            hazards: Dict[str, Dict] = {}
+            if version_ids:
+                geom_point = func.ST_SetSRID(func.ST_MakePoint(loc.longitude, loc.latitude), 4326)
+                rows = session.execute(
+                    select(HazardFeaturePolygon, HazardDatasetVersion, HazardDataset)
+                    .join(
+                        HazardDatasetVersion,
+                        HazardFeaturePolygon.hazard_dataset_version_id == HazardDatasetVersion.id,
+                    )
+                    .join(HazardDataset, HazardDatasetVersion.hazard_dataset_id == HazardDataset.id)
+                    .where(
+                        HazardFeaturePolygon.tenant_id == tenant_id,
+                        HazardDatasetVersion.tenant_id == tenant_id,
+                        HazardDataset.tenant_id == tenant_id,
+                        HazardFeaturePolygon.hazard_dataset_version_id.in_(version_ids),
+                        func.ST_Contains(HazardFeaturePolygon.geom, geom_point),
+                    )
+                ).all()
+                for feature, version, dataset in rows:
+                    entry = extract_hazard_entry(
+                        feature.properties_json or {},
+                        dataset.peril,
+                        dataset.name,
+                        version.version_label,
+                    )
+                    merge_worst_in_peril(hazards, entry, tie_breaker_id=feature.id)
+
+            normalized_hazards = {
+                peril: {k: v for k, v in entry.items() if k != "_tie_breaker_id"}
+                for peril, entry in hazards.items()
+            }
+            result_payload = compute_resilience_score(normalized_hazards, {}, config)
+            batch.append(
+                ResilienceScoreItem(
+                    tenant_id=tenant_id,
+                    resilience_score_result_id=score_result_id,
+                    location_id=loc.id,
+                    resilience_score=result_payload["resilience_score"],
+                    risk_score=result_payload["risk_score"],
+                    hazards_json=normalized_hazards,
+                    result_json=result_payload,
+                )
+            )
+            scored += 1
+
+            if len(batch) >= batch_size:
+                session.bulk_save_objects(batch)
+                session.commit()
+                batch = []
+
+        if batch:
+            session.bulk_save_objects(batch)
+            session.commit()
+
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {
+            "resilience_score_result_id": score_result_id,
+            "scored": scored,
+            "skipped_missing_coords": skipped_missing_coords,
         }
         run.code_version = settings.code_version
         session.commit()

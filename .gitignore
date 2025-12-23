@@ -7,3 +7,5 @@ frontend/node_modules
 .env.*
 .DS_Store
 infra/minio-data
+
+repo.zip

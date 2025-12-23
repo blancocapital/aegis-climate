@@ -38,6 +38,7 @@ class RunType(str, enum.Enum):
     ROLLUP = "ROLLUP"
     BREACH_EVAL = "BREACH_EVAL"
     DRIFT = "DRIFT"
+    RESILIENCE_SCORE = "RESILIENCE_SCORE"
 
 
 class RunStatus(str, enum.Enum):
@@ -299,6 +300,47 @@ class HazardOverlayResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
     __table_args__ = (Index("ix_hazard_overlay_tenant_created", "tenant_id", "created_at"),)
+
+
+class ResilienceScoreResult(Base):
+    __tablename__ = "resilience_score_result"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+    hazard_dataset_version_ids_json = Column(JSON, nullable=True)
+    scoring_config_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_resilience_score_result_tenant_created", "tenant_id", "created_at"),)
+
+
+class ResilienceScoreItem(Base):
+    __tablename__ = "resilience_score_item"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    resilience_score_result_id = Column(
+        Integer, ForeignKey("resilience_score_result.id", ondelete="CASCADE"), nullable=False
+    )
+    location_id = Column(Integer, ForeignKey("location.id", ondelete="CASCADE"), nullable=False)
+    resilience_score = Column(Integer, nullable=False)
+    risk_score = Column(Float, nullable=False)
+    hazards_json = Column(JSON, nullable=False)
+    result_json = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "tenant_id",
+            "resilience_score_result_id",
+            "location_id",
+            name="uq_resilience_score_item_unique",
+        ),
+        Index("ix_resilience_score_item_tenant_result", "tenant_id", "resilience_score_result_id"),
+        Index("ix_resilience_score_item_result_score", "resilience_score_result_id", "resilience_score"),
+    )
 
 
 class LocationHazardAttribute(Base):
