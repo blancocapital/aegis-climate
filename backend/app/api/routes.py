@@ -61,6 +61,7 @@ from app.services.request_fingerprint import canonical_json, fingerprint_resilie
 from app.services.resilience_export import iter_resilience_export_rows
 from app.services.resilience import DEFAULT_WEIGHTS, SCORING_VERSION, compute_resilience_score
 from app.services.structural import merge_structural, normalize_structural
+from app.services.explainability import build_explainability
 from app.services.property_enrichment import (
     determine_enrich_mode,
     normalize_address,
@@ -1594,6 +1595,7 @@ def score_resilience(
         "best_effort": payload.best_effort,
         "completeness": compute_structural_completeness(structural_used),
     }
+    explainability = build_explainability(result, hazard_response, structural_used, None, data_quality)
 
     return {
         "location": {
@@ -1611,6 +1613,7 @@ def score_resilience(
         "property_profile_updated_at": property_profile_updated_at,
         "property_profile": summarize_property_profile(property_profile),
         "data_quality": data_quality,
+        "explainability": explainability,
         "result": result,
     }
 
@@ -1639,6 +1642,13 @@ def underwriting_packet(
             response.get("data_quality") or {},
             policy=payload.underwriting_policy,
         )
+    explainability = build_explainability(
+        response.get("result") or {},
+        response.get("hazards") or {},
+        response.get("structural") or {},
+        decision_payload,
+        response.get("data_quality") or {},
+    )
     return {
         "property": property_summary,
         "hazards": response.get("hazards"),
@@ -1650,6 +1660,7 @@ def underwriting_packet(
         },
         "quality": response.get("data_quality"),
         "decision": decision_payload,
+        "explainability": explainability,
     }
 
 
