@@ -45,6 +45,7 @@ from app.models import (
     Breach,
 )
 from app.services.geocode import geocode_address
+from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.lineage import build_lineage
 from app.services.resilience import compute_resilience_score
 from app.storage.s3 import compute_checksum, put_object, get_object
@@ -778,33 +779,13 @@ def score_resilience(
             )
         ).all()
         for feature, version, dataset in rows:
-            properties = feature.properties_json or {}
-            peril_value = properties.get("hazard_category") or dataset.peril
-            if not peril_value:
-                continue
-            peril = str(peril_value).lower()
-            score_value = properties.get("score")
-            try:
-                score = float(score_value) if score_value is not None else None
-            except (TypeError, ValueError):
-                score = None
-            entry = {
-                "score": score,
-                "band": properties.get("band"),
-                "source": f"{dataset.name}:{version.version_label}",
-                "raw": properties,
-            }
-            existing = hazards.get(peril)
-            if existing is None:
-                hazards[peril] = entry
-                continue
-            existing_score = existing.get("score")
-            if score is None:
-                if existing_score is None:
-                    hazards[peril] = existing
-                continue
-            if existing_score is None or score > existing_score:
-                hazards[peril] = entry
+            entry = extract_hazard_entry(
+                feature.properties_json or {},
+                dataset.peril,
+                dataset.name,
+                version.version_label,
+            )
+            merge_worst_in_peril(hazards, entry)
 
     structural = payload.structural.dict() if payload.structural else {}
     result = compute_resilience_score(hazards, structural, None)

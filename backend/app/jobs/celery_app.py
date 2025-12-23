@@ -36,6 +36,7 @@ from app.models import (
 from app.services.validation import read_csv_bytes, validate_rows
 from app.services.commit import canonicalize_rows, to_location_dict
 from app.services.geocode import geocode_address
+from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.quality import quality_scores
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
@@ -456,30 +457,57 @@ def overlay_hazard(
             if loc.latitude is None or loc.longitude is None:
                 continue
             geom_point = func.ST_SetSRID(func.ST_MakePoint(loc.longitude, loc.latitude), 4326)
-            feature = (
+            features = (
                 session.query(HazardFeaturePolygon)
                 .filter(
                     HazardFeaturePolygon.tenant_id == tenant_id,
                     HazardFeaturePolygon.hazard_dataset_version_id == hazard_dataset_version_id,
                     func.ST_Contains(HazardFeaturePolygon.geom, geom_point),
                 )
-                .order_by(HazardFeaturePolygon.id.asc())
-                .first()
+                .all()
             )
-            if not feature:
+            if not features:
                 continue
-            props = feature.properties_json or {}
+            hazards: Dict[str, Dict] = {}
+            for feature in features:
+                entry = extract_hazard_entry(
+                    feature.properties_json or {},
+                    hazard_dataset.peril if hazard_dataset else None,
+                    hazard_dataset.name if hazard_dataset else str(hdv.hazard_dataset_id),
+                    hdv.version_label,
+                )
+                merge_worst_in_peril(hazards, entry, tie_breaker_id=feature.id)
+            if not hazards:
+                continue
+            best_entry = None
+            for entry in hazards.values():
+                entry_score = entry.get("score")
+                if best_entry is None:
+                    best_entry = entry
+                    continue
+                best_score = best_entry.get("score")
+                if best_score is None and entry_score is not None:
+                    best_entry = entry
+                    continue
+                if entry_score is None:
+                    continue
+                if best_score is None or entry_score > best_score:
+                    best_entry = entry
+                    continue
+                if entry_score == best_score:
+                    entry_id = entry.get("_tie_breaker_id")
+                    best_id = best_entry.get("_tie_breaker_id")
+                    if entry_id is not None and best_id is not None and entry_id < best_id:
+                        best_entry = entry
+            if not best_entry:
+                continue
+            props = best_entry.get("raw") or {}
             attributes = {
-                "hazard_category": (
-                    props.get("hazard_category")
-                    or props.get("peril")
-                    or props.get("hazard")
-                    or (hazard_dataset.peril if hazard_dataset else None)
-                ),
-                "band": props.get("band") or props.get("Band"),
+                "hazard_category": best_entry.get("peril"),
+                "band": best_entry.get("band"),
                 "percentile": props.get("percentile"),
-                "score": props.get("score"),
-                "source": f"{hazard_dataset.name if hazard_dataset else hdv.hazard_dataset_id}:{hdv.version_label}",
+                "score": best_entry.get("score"),
+                "source": best_entry.get("source"),
                 "method": "POSTGIS_SPATIAL_JOIN",
                 "raw": props,
             }
