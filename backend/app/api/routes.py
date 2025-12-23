@@ -16,7 +16,9 @@ from sqlalchemy.orm import Session
 
 from app.core.auth import TokenData, create_access_token, require_role, verify_password
 from app.core.config import get_settings
+from app.core.request_id import get_request_id
 from app.db import get_db
+from app.jobs.celery_app import celery_app
 from app.jobs.celery_app import commit_upload as commit_task
 from app.jobs.celery_app import validate_upload as validate_task
 from app.jobs.celery_app import geocode_and_score as geocode_task
@@ -87,6 +89,12 @@ def emit_audit(session: Session, tenant_id: str, user_id: Optional[str], action:
     session.commit()
 
 
+def apply_request_id(run: Run) -> None:
+    request_id = get_request_id()
+    if request_id:
+        run.request_id = request_id
+
+
 def serialize_run(run: Run) -> Dict[str, Any]:
     return {
         "id": run.id,
@@ -105,7 +113,20 @@ def serialize_run(run: Run) -> Dict[str, Any]:
         "created_at": run.created_at.isoformat() if run.created_at else None,
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+        "cancelled_at": run.cancelled_at.isoformat() if run.cancelled_at else None,
+        "request_id": run.request_id,
+        "celery_task_id": run.celery_task_id,
     }
+
+
+def extract_progress(output_refs_json: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not output_refs_json:
+        return None
+    processed = output_refs_json.get("processed")
+    total = output_refs_json.get("total")
+    if processed is None and total is None:
+        return None
+    return {"processed": processed, "total": total}
 
 
 def build_hazard_versions(db: Session, tenant_id: str, version_ids: List[int]) -> List[Dict[str, Any]]:
@@ -379,9 +400,12 @@ def trigger_validate(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
-    validate_task.delay(run.id, upload_id, user.tenant_id)
+    async_result = validate_task.delay(run.id, upload_id, user.tenant_id, run.request_id)
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "validation_requested", {"upload_id": upload_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -472,14 +496,23 @@ def trigger_commit(
         tenant_id=user.tenant_id,
         run_type=RunType.COMMIT,
         status=RunStatus.QUEUED,
-        input_refs_json={"upload_id": upload_id},
+        input_refs_json={"upload_id": upload_id, "name": commit_name or f"Exposure {upload_id}"},
         config_refs_json={"mapping_template_id": upload.mapping_template_id, "idempotency_key": idempotency_key},
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
-    commit_task.delay(run.id, upload_id, user.tenant_id, commit_name or f"Exposure {upload_id}")
+    async_result = commit_task.delay(
+        run.id,
+        upload_id,
+        user.tenant_id,
+        commit_name or f"Exposure {upload_id}",
+        run.request_id,
+    )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "commit_requested", {"upload_id": upload_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -708,19 +741,24 @@ def resolve_property_profile(
         input_refs_json={
             "address_fingerprint": fingerprint,
             "location_id": payload.location_id,
+            "address": payload.address,
         },
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
-    enrich_property_profile_task.delay(
+    async_result = enrich_property_profile_task.delay(
         run.id,
         user.tenant_id,
         payload.address,
         payload.location_id,
         payload.force_refresh,
+        run.request_id,
     )
+    run.celery_task_id = async_result.id
+    db.commit()
     return {
         "run_id": run.id,
         "property_profile_id": existing.id if existing else None,
@@ -774,7 +812,238 @@ def get_property_profile_run_status(
     if not run or run.tenant_id != user.tenant_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     status_value = run.status.value if hasattr(run.status, "value") else run.status
-    return {"run_id": run.id, "status": status_value, "output_refs": run.output_refs_json}
+    progress = extract_progress(run.output_refs_json)
+    return {
+        "run_id": run.id,
+        "status": status_value,
+        "output_refs": run.output_refs_json,
+        "request_id": run.request_id,
+        "celery_task_id": run.celery_task_id,
+        "progress": progress,
+        "started_at": run.started_at.isoformat() if run.started_at else None,
+        "finished_at": run.completed_at.isoformat() if run.completed_at else None,
+        "cancelled_at": run.cancelled_at.isoformat() if run.cancelled_at else None,
+    }
+
+
+@router.post("/runs/{run_id}/cancel")
+def cancel_run(
+    run_id: int,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    run = db.get(Run, run_id)
+    if not run or run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    status_value = run.status.value if hasattr(run.status, "value") else run.status
+    if status_value in (RunStatus.QUEUED.value, RunStatus.RUNNING.value, RunStatus.QUEUED, RunStatus.RUNNING):
+        run.status = RunStatus.CANCELLED
+        run.cancelled_at = datetime.utcnow()
+        run.completed_at = datetime.utcnow()
+        db.commit()
+        if run.celery_task_id:
+            try:
+                celery_app.control.revoke(run.celery_task_id, terminate=False)
+            except Exception:
+                pass
+        status_value = RunStatus.CANCELLED.value
+    return {
+        "run_id": run.id,
+        "status": status_value,
+        "request_id": run.request_id,
+        "celery_task_id": run.celery_task_id,
+        "cancelled_at": run.cancelled_at.isoformat() if run.cancelled_at else None,
+    }
+
+
+@router.post("/runs/{run_id}/retry")
+def retry_run(
+    run_id: int,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    run = db.get(Run, run_id)
+    if not run or run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    status_value = run.status.value if hasattr(run.status, "value") else run.status
+    if status_value not in (RunStatus.FAILED.value, RunStatus.CANCELLED.value, RunStatus.FAILED, RunStatus.CANCELLED):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Run is not retryable")
+
+    new_run = Run(
+        tenant_id=user.tenant_id,
+        run_type=run.run_type,
+        status=RunStatus.QUEUED,
+        input_refs_json=run.input_refs_json,
+        config_refs_json=run.config_refs_json,
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    apply_request_id(new_run)
+    db.add(new_run)
+    db.commit()
+
+    response: Dict[str, Any] = {"run_id": new_run.id, "status": new_run.status}
+    if run.run_type == RunType.RESILIENCE_SCORE:
+        result = db.execute(
+            select(ResilienceScoreResult).where(ResilienceScoreResult.run_id == run.id)
+        ).scalar_one_or_none()
+        if not result:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Resilience score result not found")
+        db.query(ResilienceScoreItem).filter(
+            ResilienceScoreItem.tenant_id == user.tenant_id,
+            ResilienceScoreItem.resilience_score_result_id == result.id,
+        ).delete(synchronize_session=False)
+        result.run_id = new_run.id
+        db.commit()
+        async_result = resilience_score_task.delay(
+            new_run.id,
+            result.id,
+            result.exposure_version_id,
+            result.hazard_dataset_version_ids_json or [],
+            user.tenant_id,
+            result.scoring_config_json,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+        response.update({"resilience_score_result_id": result.id})
+    elif run.run_type == RunType.PROPERTY_ENRICHMENT:
+        address = (run.input_refs_json or {}).get("address")
+        if not address:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing address for retry")
+        location_id = (run.input_refs_json or {}).get("location_id")
+        async_result = enrich_property_profile_task.delay(
+            new_run.id,
+            user.tenant_id,
+            address,
+            location_id,
+            True,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+        fingerprint = (run.input_refs_json or {}).get("address_fingerprint")
+        if not fingerprint:
+            fingerprint = address_fingerprint(normalize_address(address))
+        profile = db.execute(
+            select(PropertyProfile).where(
+                PropertyProfile.tenant_id == user.tenant_id,
+                PropertyProfile.address_fingerprint == fingerprint,
+            )
+        ).scalar_one_or_none()
+        response.update({"property_profile_id": profile.id if profile else None})
+    elif run.run_type == RunType.VALIDATION:
+        upload_id = (run.input_refs_json or {}).get("upload_id")
+        if not upload_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing upload_id for retry")
+        async_result = validate_task.delay(new_run.id, upload_id, user.tenant_id, new_run.request_id)
+        new_run.celery_task_id = async_result.id
+        db.commit()
+    elif run.run_type == RunType.COMMIT:
+        upload_id = (run.input_refs_json or {}).get("upload_id")
+        if not upload_id:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing upload_id for retry")
+        name = (run.input_refs_json or {}).get("name") or f"Exposure {upload_id}"
+        async_result = commit_task.delay(new_run.id, upload_id, user.tenant_id, name, new_run.request_id)
+        new_run.celery_task_id = async_result.id
+        db.commit()
+    elif run.run_type == RunType.GEOCODE:
+        exposure_version_id = (run.input_refs_json or {}).get("exposure_version_id")
+        if exposure_version_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing exposure_version_id for retry")
+        async_result = geocode_task.delay(new_run.id, exposure_version_id, user.tenant_id, new_run.request_id)
+        new_run.celery_task_id = async_result.id
+        db.commit()
+    elif run.run_type == RunType.OVERLAY:
+        overlay = db.execute(
+            select(HazardOverlayResult).where(HazardOverlayResult.run_id == run.id)
+        ).scalar_one_or_none()
+        if not overlay:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hazard overlay result not found")
+        db.query(LocationHazardAttribute).filter(
+            LocationHazardAttribute.tenant_id == user.tenant_id,
+            LocationHazardAttribute.hazard_overlay_result_id == overlay.id,
+        ).delete(synchronize_session=False)
+        overlay.run_id = new_run.id
+        db.commit()
+        params = (run.config_refs_json or {}).get("params")
+        async_result = overlay_task.delay(
+            new_run.id,
+            overlay.id,
+            overlay.exposure_version_id,
+            overlay.hazard_dataset_version_id,
+            user.tenant_id,
+            params,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+        response.update({"overlay_result_id": overlay.id})
+    elif run.run_type == RunType.ROLLUP:
+        rollup_result = db.execute(
+            select(RollupResult).where(RollupResult.run_id == run.id)
+        ).scalar_one_or_none()
+        if not rollup_result:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup result not found")
+        db.query(RollupResultItem).filter(
+            RollupResultItem.tenant_id == user.tenant_id,
+            RollupResultItem.rollup_result_id == rollup_result.id,
+        ).delete(synchronize_session=False)
+        rollup_result.run_id = new_run.id
+        db.commit()
+        async_result = rollup_task.delay(
+            new_run.id,
+            rollup_result.id,
+            rollup_result.exposure_version_id,
+            rollup_result.rollup_config_id,
+            rollup_result.hazard_overlay_result_ids_json or [],
+            user.tenant_id,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+        response.update({"rollup_result_id": rollup_result.id})
+    elif run.run_type == RunType.BREACH_EVAL:
+        rollup_result_id = (run.input_refs_json or {}).get("rollup_result_id")
+        threshold_rule_ids = (run.config_refs_json or {}).get("threshold_rule_ids")
+        if rollup_result_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing rollup_result_id for retry")
+        async_result = breach_task.delay(
+            new_run.id,
+            rollup_result_id,
+            threshold_rule_ids,
+            user.tenant_id,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+    elif run.run_type == RunType.DRIFT:
+        drift_run = db.execute(
+            select(DriftRun).where(DriftRun.run_id == run.id)
+        ).scalar_one_or_none()
+        if not drift_run:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Drift run not found")
+        db.query(DriftDetail).filter(
+            DriftDetail.tenant_id == user.tenant_id,
+            DriftDetail.drift_run_id == drift_run.id,
+        ).delete(synchronize_session=False)
+        drift_run.run_id = new_run.id
+        db.commit()
+        async_result = drift_task.delay(
+            new_run.id,
+            drift_run.id,
+            drift_run.exposure_version_a_id,
+            drift_run.exposure_version_b_id,
+            user.tenant_id,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
+        response.update({"drift_run_id": drift_run.id})
+    else:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported run type")
+
+    return response
 
 
 @router.get("/exposure-versions/{exposure_version_id}/exceptions")
@@ -838,9 +1107,12 @@ def trigger_geocode(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
-    geocode_task.delay(run.id, exposure_version_id, user.tenant_id)
+    async_result = geocode_task.delay(run.id, exposure_version_id, user.tenant_id, run.request_id)
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "geocode_requested", {"exposure_version_id": exposure_version_id})
     return {"run_id": run.id, "status": run.status}
 
@@ -1090,19 +1362,23 @@ def score_resilience(
                         tenant_id=user.tenant_id,
                         run_type=RunType.PROPERTY_ENRICHMENT,
                         status=RunStatus.QUEUED,
-                        input_refs_json={"address_fingerprint": fingerprint},
+                        input_refs_json={"address_fingerprint": fingerprint, "address": address_json},
                         created_by=user.user_id,
                         code_version=settings.code_version,
                     )
+                    apply_request_id(run)
                     db.add(run)
                     db.commit()
-                    enrich_property_profile_task.delay(
+                    async_result = enrich_property_profile_task.delay(
                         run.id,
                         user.tenant_id,
                         address_json,
                         None,
                         False,
+                        run.request_id,
                     )
+                    run.celery_task_id = async_result.id
+                    db.commit()
                     wait_seconds = payload.wait_for_enrichment_seconds or 0
                     run_status = None
                     if wait_seconds > 0:
@@ -1534,6 +1810,7 @@ def create_resilience_scores(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
 
@@ -1569,14 +1846,17 @@ def create_resilience_scores(
                 }
         raise
 
-    resilience_score_task.delay(
+    async_result = resilience_score_task.delay(
         run.id,
         result.id,
         payload.exposure_version_id,
         version_ids,
         user.tenant_id,
         payload.config,
+        run.request_id,
     )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "resilience_scores_requested", {"resilience_score_result_id": result.id})
     return {"resilience_score_result_id": result.id, "run_id": run.id, "status": "QUEUED"}
 
@@ -1598,7 +1878,18 @@ def get_resilience_score_status(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
     run = db.get(Run, result.run_id) if result.run_id else None
     status_value = run.status.value if run and hasattr(run.status, "value") else (run.status if run else "PENDING")
-    return {"resilience_score_result_id": result.id, "status": status_value, "run_id": result.run_id}
+    progress = extract_progress(run.output_refs_json) if run else None
+    return {
+        "resilience_score_result_id": result.id,
+        "status": status_value,
+        "run_id": result.run_id,
+        "request_id": run.request_id if run else None,
+        "celery_task_id": run.celery_task_id if run else None,
+        "progress": progress,
+        "started_at": run.started_at.isoformat() if run and run.started_at else None,
+        "finished_at": run.completed_at.isoformat() if run and run.completed_at else None,
+        "cancelled_at": run.cancelled_at.isoformat() if run and run.cancelled_at else None,
+    }
 
 
 @router.get("/resilience-scores/{resilience_score_result_id}/summary")
@@ -1909,6 +2200,7 @@ def trigger_hazard_overlays(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
     overlay = HazardOverlayResult(
@@ -1921,7 +2213,17 @@ def trigger_hazard_overlays(
     )
     db.add(overlay)
     db.commit()
-    overlay_task.delay(run.id, overlay.id, payload.exposure_version_id, hazard_dataset_version_id, user.tenant_id, payload.params)
+    async_result = overlay_task.delay(
+        run.id,
+        overlay.id,
+        payload.exposure_version_id,
+        hazard_dataset_version_id,
+        user.tenant_id,
+        payload.params,
+        run.request_id,
+    )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "overlay_requested", {"overlay_result_id": overlay.id})
     return {"overlay_result_id": overlay.id, "run_id": run.id}
 
@@ -1985,6 +2287,7 @@ def trigger_drift(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
     drift_run = DriftRun(
@@ -1996,7 +2299,16 @@ def trigger_drift(
     )
     db.add(drift_run)
     db.commit()
-    drift_task.delay(run.id, drift_run.id, payload.exposure_version_a, payload.exposure_version_b, user.tenant_id)
+    async_result = drift_task.delay(
+        run.id,
+        drift_run.id,
+        payload.exposure_version_a,
+        payload.exposure_version_b,
+        user.tenant_id,
+        run.request_id,
+    )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "drift_requested", {"drift_run_id": drift_run.id})
     return {"run_id": run.id, "drift_run_id": drift_run.id, "status": run.status}
 
@@ -2168,6 +2480,7 @@ def trigger_rollup(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
     rollup_result = RollupResult(
@@ -2179,14 +2492,17 @@ def trigger_rollup(
     )
     db.add(rollup_result)
     db.commit()
-    rollup_task.delay(
+    async_result = rollup_task.delay(
         run.id,
         rollup_result.id,
         payload.exposure_version_id,
         payload.rollup_config_id,
         payload.hazard_overlay_result_ids,
         user.tenant_id,
+        run.request_id,
     )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "rollup_requested", {"rollup_result_id": rollup_result.id})
     return {"id": rollup_result.id, "run_id": run.id}
 
@@ -2338,9 +2654,18 @@ def run_breach_eval(
         created_by=user.user_id,
         code_version=settings.code_version,
     )
+    apply_request_id(run)
     db.add(run)
     db.commit()
-    breach_task.delay(run.id, payload.rollup_result_id, payload.threshold_rule_ids, user.tenant_id)
+    async_result = breach_task.delay(
+        run.id,
+        payload.rollup_result_id,
+        payload.threshold_rule_ids,
+        user.tenant_id,
+        run.request_id,
+    )
+    run.celery_task_id = async_result.id
+    db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "breach_eval_requested", {"rollup_result_id": payload.rollup_result_id})
     return {"run_id": run.id, "status": run.status}
 

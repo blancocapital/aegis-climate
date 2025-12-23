@@ -1,8 +1,7 @@
 import json
+import logging
 from datetime import datetime
-from typing import Dict, List, Optional
-
-from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 from celery import Celery
 from sqlalchemy import select
@@ -55,25 +54,51 @@ from app.services.structural import merge_structural, normalize_structural
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.services.drift import COMPARE_FIELDS, compare_exposures
+from app.services.run_progress import merge_run_progress
 from app.storage.s3 import compute_checksum, get_object, put_object
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 celery_app = Celery(
     "aegis", broker=settings.redis_url, backend=settings.redis_url
 )
 
 
+def _attach_request_id(run: Run, request_id: Optional[str]) -> None:
+    if request_id and not run.request_id:
+        run.request_id = request_id
+
+
+def _update_progress(
+    session: SessionLocal,
+    run: Run,
+    processed: Optional[int],
+    total: Optional[int],
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    run.output_refs_json = merge_run_progress(run.output_refs_json, processed, total, extra=extra)
+    session.commit()
+
+
+def _log_task_start(task_name: str, run_id: int, request_id: Optional[str]) -> None:
+    logger.info("%s started run_id=%s request_id=%s", task_name, run_id, request_id)
+
+
 @celery_app.task
-def validate_upload(run_id: int, upload_id: str, tenant_id: str):
+def validate_upload(run_id: int, upload_id: str, tenant_id: str, request_id: Optional[str] = None):
     session = SessionLocal()
     run = session.get(Run, run_id)
     if not run or run.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("validate_upload", run_id, request_id)
         upload = session.get(ExposureUpload, upload_id)
         if not upload:
             raise ValueError("upload not found")
@@ -81,6 +106,8 @@ def validate_upload(run_id: int, upload_id: str, tenant_id: str):
         key = upload.object_uri.split(f"s3://{settings.minio_bucket}/", 1)[1]
         raw_bytes = get_object(key)
         rows = read_csv_bytes(raw_bytes)
+        total_rows = len(rows) if hasattr(rows, "__len__") else None
+        _update_progress(session, run, processed=0, total=total_rows)
         summary, issues, artifact_bytes, checksum = validate_rows(rows, mapping.template_json if mapping else {})
         key_errs = f"validations/{tenant_id}/{upload_id}/row_errors.json"
         uri = put_object(key_errs, artifact_bytes, content_type="application/json")
@@ -96,7 +123,11 @@ def validate_upload(run_id: int, upload_id: str, tenant_id: str):
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {"validation_result_id": validation.id}
+        run.output_refs_json = merge_run_progress(
+            {"validation_result_id": validation.id},
+            processed=total_rows,
+            total=total_rows,
+        )
         run.artifact_checksums_json = {"row_errors": checksum}
         run.code_version = settings.code_version
         session.commit()
@@ -118,6 +149,7 @@ def rollup_execute(
     rollup_config_id: int,
     hazard_overlay_result_ids: List[int],
     tenant_id: str,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
@@ -125,9 +157,13 @@ def rollup_execute(
     if not run or not rollup_result or run.tenant_id != tenant_id or rollup_result.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("rollup_execute", run_id, request_id)
         config = session.get(RollupConfig, rollup_config_id)
         if not config or config.tenant_id != tenant_id:
             raise ValueError("rollup config not found")
@@ -149,6 +185,8 @@ def rollup_execute(
             Location.tenant_id == tenant_id,
             Location.exposure_version_id == exposure_version_id,
         ).all()
+        total_locations = len(locations)
+        _update_progress(session, run, processed=0, total=total_locations)
         enriched = []
         for loc in locations:
             attrs = attr_map.get(loc.id, {})
@@ -188,7 +226,11 @@ def rollup_execute(
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {"rollup_result_id": rollup_result_id}
+        run.output_refs_json = merge_run_progress(
+            {"rollup_result_id": rollup_result_id},
+            processed=total_locations,
+            total=total_locations,
+        )
         run.artifact_checksums_json = {"rollup_result_checksum": checksum}
         run.code_version = settings.code_version
         session.commit()
@@ -207,6 +249,7 @@ def breach_evaluate(
     rollup_result_id: int,
     threshold_rule_ids: List[int] | None,
     tenant_id: str,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
@@ -214,9 +257,13 @@ def breach_evaluate(
     if not run or not rollup_result or run.tenant_id != tenant_id or rollup_result.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("breach_evaluate", run_id, request_id)
         exposure_version = session.get(ExposureVersion, rollup_result.exposure_version_id)
         if not exposure_version or exposure_version.tenant_id != tenant_id:
             raise ValueError("exposure version not found")
@@ -230,6 +277,7 @@ def breach_evaluate(
             RollupResultItem.tenant_id == tenant_id,
             RollupResultItem.rollup_result_id == rollup_result_id,
         ).all()
+        _update_progress(session, run, processed=0, total=len(items))
         rows = [
             {
                 "rollup_key_json": item.rollup_key_json,
@@ -302,12 +350,16 @@ def breach_evaluate(
             session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {
-            "rollup_result_id": rollup_result_id,
-            "breaches_open": opened,
-            "breaches_resolved": resolved,
-            "rules_evaluated": len(rules),
-        }
+        run.output_refs_json = merge_run_progress(
+            {
+                "rollup_result_id": rollup_result_id,
+                "breaches_open": opened,
+                "breaches_resolved": resolved,
+                "rules_evaluated": len(rules),
+            },
+            processed=len(items),
+            total=len(items),
+        )
         run.code_version = settings.code_version
         session.commit()
     except Exception:
@@ -320,15 +372,19 @@ def breach_evaluate(
 
 
 @celery_app.task
-def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Exposure"):
+def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Exposure", request_id: Optional[str] = None):
     session = SessionLocal()
     run = session.get(Run, run_id)
     if not run or run.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("commit_upload", run_id, request_id)
         upload = session.get(ExposureUpload, upload_id)
         if not upload:
             raise ValueError("upload not found")
@@ -337,6 +393,8 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
         key = upload.object_uri.split(f"s3://{settings.minio_bucket}/", 1)[1]
         raw_bytes = get_object(key)
         rows = canonicalize_rows(raw_bytes, mapping.template_json if mapping else {})
+        total_rows = len(rows) if hasattr(rows, "__len__") else None
+        _update_progress(session, run, processed=0, total=total_rows)
         exposure_version = ExposureVersion(
             tenant_id=tenant_id,
             upload_id=upload_id,
@@ -375,7 +433,11 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {"exposure_version_id": exposure_version.id}
+        run.output_refs_json = merge_run_progress(
+            {"exposure_version_id": exposure_version.id},
+            processed=total_rows,
+            total=total_rows,
+        )
         run.code_version = settings.code_version
         session.commit()
         return {"exposure_version_id": exposure_version.id, "run_id": run.id}
@@ -389,19 +451,25 @@ def commit_upload(run_id: int, upload_id: str, tenant_id: str, name: str = "Expo
 
 
 @celery_app.task
-def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str):
+def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str, request_id: Optional[str] = None):
     session = SessionLocal()
     run = session.get(Run, run_id)
     if not run or run.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("geocode_and_score", run_id, request_id)
         locations = session.query(Location).filter(
             Location.exposure_version_id == exposure_version_id,
             Location.tenant_id == tenant_id,
         ).all()
+        total_locations = len(locations)
+        _update_progress(session, run, processed=0, total=total_locations)
         for loc in locations:
             if loc.latitude is None or loc.longitude is None:
                 lat, lon, conf, method = geocode_address(
@@ -425,7 +493,11 @@ def geocode_and_score(run_id: int, exposure_version_id: int, tenant_id: str):
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {"exposure_version_id": exposure_version_id}
+        run.output_refs_json = merge_run_progress(
+            {"exposure_version_id": exposure_version_id},
+            processed=total_locations,
+            total=total_locations,
+        )
         run.code_version = settings.code_version
         session.commit()
     except Exception:
@@ -445,6 +517,7 @@ def overlay_hazard(
     hazard_dataset_version_id: int,
     tenant_id: str,
     params: Dict | None = None,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
@@ -452,9 +525,13 @@ def overlay_hazard(
     if not run or not overlay_result or run.tenant_id != tenant_id or overlay_result.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("overlay_hazard", run_id, request_id)
         ev = session.get(ExposureVersion, exposure_version_id)
         if not ev:
             raise ValueError("exposure version not found")
@@ -466,9 +543,13 @@ def overlay_hazard(
             Location.tenant_id == tenant_id,
             Location.exposure_version_id == exposure_version_id,
         ).all()
+        total_locations = len(locations)
+        _update_progress(session, run, processed=0, total=total_locations)
         saved_attrs = []
+        processed = 0
         for loc in locations:
             if loc.latitude is None or loc.longitude is None:
+                processed += 1
                 continue
             geom_point = func.ST_SetSRID(func.ST_MakePoint(loc.longitude, loc.latitude), 4326)
             features = (
@@ -533,18 +614,25 @@ def overlay_hazard(
                     attributes_json=attributes,
                 )
             )
+            processed += 1
+            if processed % 200 == 0:
+                _update_progress(session, run, processed=processed, total=total_locations)
         if saved_attrs:
             session.bulk_save_objects(saved_attrs)
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {
-            "hazard_overlay_result_id": overlay_result.id,
-            "summary": {
-                "locations": len(locations),
-                "attributes_created": len(saved_attrs),
+        run.output_refs_json = merge_run_progress(
+            {
+                "hazard_overlay_result_id": overlay_result.id,
+                "summary": {
+                    "locations": len(locations),
+                    "attributes_created": len(saved_attrs),
+                },
             },
-        }
+            processed=processed,
+            total=total_locations,
+        )
         run.code_version = settings.code_version
         session.commit()
     except Exception:
@@ -564,6 +652,7 @@ def compute_resilience_scores(
     hazard_dataset_version_ids: List[int],
     tenant_id: str,
     config: Optional[Dict] = None,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
@@ -576,13 +665,19 @@ def compute_resilience_scores(
     ):
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("compute_resilience_scores", run_id, request_id)
         locations = session.query(Location).filter(
             Location.tenant_id == tenant_id,
             Location.exposure_version_id == exposure_version_id,
         ).all()
+        total_locations = len(locations)
+        _update_progress(session, run, processed=0, total=total_locations)
         scored = 0
         skipped_missing_coords = 0
         with_structural_count = 0
@@ -664,6 +759,7 @@ def compute_resilience_scores(
                 session.bulk_save_objects(batch)
                 session.commit()
                 batch = []
+                _update_progress(session, run, processed=scored + skipped_missing_coords, total=total_locations)
 
         if batch:
             session.bulk_save_objects(batch)
@@ -671,16 +767,20 @@ def compute_resilience_scores(
 
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {
-            "resilience_score_result_id": score_result_id,
-            "scored": scored,
-            "skipped_missing_coords": skipped_missing_coords,
-            "with_structural_count": with_structural_count,
-            "without_structural_count": without_structural_count,
-            "peril_coverage": peril_coverage,
-            "unknown_hazard_fallback_used_count": unknown_hazard_fallback_used_count,
-            "missing_tiv_count": missing_tiv_count,
-        }
+        run.output_refs_json = merge_run_progress(
+            {
+                "resilience_score_result_id": score_result_id,
+                "scored": scored,
+                "skipped_missing_coords": skipped_missing_coords,
+                "with_structural_count": with_structural_count,
+                "without_structural_count": without_structural_count,
+                "peril_coverage": peril_coverage,
+                "unknown_hazard_fallback_used_count": unknown_hazard_fallback_used_count,
+                "missing_tiv_count": missing_tiv_count,
+            },
+            processed=scored + skipped_missing_coords,
+            total=total_locations,
+        )
         run.code_version = settings.code_version
         session.commit()
     except Exception:
@@ -699,15 +799,21 @@ def enrich_property_profile(
     address_json: Dict,
     location_id: Optional[int] = None,
     force_refresh: bool = False,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
     if not run or run.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("enrich_property_profile", run_id, request_id)
+        _update_progress(session, run, processed=0, total=1)
 
         normalized = normalize_address(address_json)
         fingerprint = address_fingerprint(normalized)
@@ -728,14 +834,18 @@ def enrich_property_profile(
         if profile_by_fingerprint and is_profile_fresh(profile_by_fingerprint.updated_at) and not force_refresh:
             run.status = RunStatus.SUCCEEDED
             run.completed_at = datetime.utcnow()
-            run.output_refs_json = {
-                "property_profile_id": profile_by_fingerprint.id,
-                "address_fingerprint": fingerprint,
-                "providers": (profile_by_fingerprint.provenance_json or {}).get("providers"),
-                "field_coverage": {
-                    key: key in (profile_by_fingerprint.structural_json or {}) for key in STRUCTURAL_KEYS
+            run.output_refs_json = merge_run_progress(
+                {
+                    "property_profile_id": profile_by_fingerprint.id,
+                    "address_fingerprint": fingerprint,
+                    "providers": (profile_by_fingerprint.provenance_json or {}).get("providers"),
+                    "field_coverage": {
+                        key: key in (profile_by_fingerprint.structural_json or {}) for key in STRUCTURAL_KEYS
+                    },
                 },
-            }
+                processed=1,
+                total=1,
+            )
             run.code_version = settings.code_version
             session.commit()
             return
@@ -790,12 +900,16 @@ def enrich_property_profile(
         field_coverage = {key: key in (profile.structural_json or {}) for key in STRUCTURAL_KEYS}
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {
-            "property_profile_id": profile.id,
-            "address_fingerprint": fingerprint,
-            "providers": (profile.provenance_json or {}).get("providers"),
-            "field_coverage": field_coverage,
-        }
+        run.output_refs_json = merge_run_progress(
+            {
+                "property_profile_id": profile.id,
+                "address_fingerprint": fingerprint,
+                "providers": (profile.provenance_json or {}).get("providers"),
+                "field_coverage": field_coverage,
+            },
+            processed=1,
+            total=1,
+        )
         run.code_version = settings.code_version
         session.add(
             AuditEvent(
@@ -822,6 +936,7 @@ def drift_compare(
     exposure_version_a_id: int,
     exposure_version_b_id: int,
     tenant_id: str,
+    request_id: Optional[str] = None,
 ):
     session = SessionLocal()
     run = session.get(Run, run_id)
@@ -829,15 +944,20 @@ def drift_compare(
     if not run or not drift_run or run.tenant_id != tenant_id or drift_run.tenant_id != tenant_id:
         return
     try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
         run.status = RunStatus.RUNNING
         run.started_at = datetime.utcnow()
         session.commit()
+        _log_task_start("drift_compare", run_id, request_id)
         locs_a = session.query(Location).filter(
             Location.tenant_id == tenant_id, Location.exposure_version_id == exposure_version_a_id
         ).all()
         locs_b = session.query(Location).filter(
             Location.tenant_id == tenant_id, Location.exposure_version_id == exposure_version_b_id
         ).all()
+        _update_progress(session, run, processed=0, total=len(locs_a) + len(locs_b))
         loc_dict_a = [
             {field: getattr(l, field) for field in COMPARE_FIELDS}
             for l in locs_a
@@ -866,12 +986,16 @@ def drift_compare(
         session.commit()
         run.status = RunStatus.SUCCEEDED
         run.completed_at = datetime.utcnow()
-        run.output_refs_json = {
-            "drift_run_id": drift_run_id,
-            "storage_uri": uri,
-            "checksum": checksum,
-            "summary": summary,
-        }
+        run.output_refs_json = merge_run_progress(
+            {
+                "drift_run_id": drift_run_id,
+                "storage_uri": uri,
+                "checksum": checksum,
+                "summary": summary,
+            },
+            processed=len(locs_a) + len(locs_b),
+            total=len(locs_a) + len(locs_b),
+        )
         run.artifact_checksums_json = {"drift_details": checksum}
         run.code_version = settings.code_version
         session.commit()

@@ -47,6 +47,7 @@ class RunStatus(str, enum.Enum):
     RUNNING = "RUNNING"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class Tenant(Base):
@@ -98,13 +99,19 @@ class Run(Base):
     output_refs_json = Column(JSON, nullable=True)
     artifact_checksums_json = Column(JSON, nullable=True)
     code_version = Column(String, nullable=True)
+    request_id = Column(String, nullable=True)
+    celery_task_id = Column(String, nullable=True)
     created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    cancelled_at = Column(DateTime, nullable=True)
 
-    __table_args__ = (Index("ix_run_tenant_created", "tenant_id", "created_at"),)
+    __table_args__ = (
+        Index("ix_run_tenant_created", "tenant_id", "created_at"),
+        Index("ix_run_tenant_request", "tenant_id", "request_id"),
+    )
 
 
 class ExposureUpload(Base):
