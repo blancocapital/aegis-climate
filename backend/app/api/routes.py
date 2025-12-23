@@ -50,8 +50,9 @@ from app.models import (
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.lineage import build_lineage
+from app.services.quality_metrics import compute_bucket_percentages
 from app.services.resilience_export import iter_resilience_export_rows
-from app.services.resilience import compute_resilience_score
+from app.services.resilience import DEFAULT_WEIGHTS, SCORING_VERSION, compute_resilience_score
 from app.services.structural import merge_structural, normalize_structural
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
@@ -88,6 +89,35 @@ def serialize_run(run: Run) -> Dict[str, Any]:
         "started_at": run.started_at.isoformat() if run.started_at else None,
         "completed_at": run.completed_at.isoformat() if run.completed_at else None,
     }
+
+
+def build_hazard_versions(db: Session, tenant_id: str, version_ids: List[int]) -> List[Dict[str, Any]]:
+    if not version_ids:
+        return []
+    rows = db.execute(
+        select(HazardDatasetVersion, HazardDataset)
+        .join(HazardDataset, HazardDatasetVersion.hazard_dataset_id == HazardDataset.id)
+        .where(
+            HazardDatasetVersion.tenant_id == tenant_id,
+            HazardDataset.tenant_id == tenant_id,
+            HazardDatasetVersion.id.in_(version_ids),
+        )
+        .order_by(HazardDataset.id.asc(), HazardDatasetVersion.id.asc())
+    ).all()
+    versions = []
+    for version, dataset in rows:
+        versions.append(
+            {
+                "hazard_dataset_id": dataset.id,
+                "hazard_dataset_name": dataset.name,
+                "peril": dataset.peril,
+                "hazard_dataset_version_id": version.id,
+                "version_label": version.version_label,
+                "effective_date": version.effective_date.isoformat() if version.effective_date else None,
+                "created_at": version.created_at.isoformat(),
+            }
+        )
+    return versions
 
 
 class MappingRequest(BaseModel):
@@ -876,6 +906,7 @@ def score_resilience(
             if latest:
                 version_ids.append(latest)
 
+    hazard_versions_used = build_hazard_versions(db, user.tenant_id, version_ids)
     hazards: Dict[str, Dict[str, Any]] = {}
     if version_ids:
         point = func.ST_SetSRID(func.ST_MakePoint(lon, lat), 4326)
@@ -905,6 +936,16 @@ def score_resilience(
         peril: {"score": data.get("score"), "band": data.get("band"), "source": data.get("source")}
         for peril, data in hazards.items()
     }
+    perils = list(DEFAULT_WEIGHTS.keys())
+    peril_present = []
+    peril_missing = []
+    for peril in perils:
+        score_value = hazards.get(peril, {}).get("score") if hazards.get(peril) else None
+        if isinstance(score_value, (int, float)):
+            peril_present.append(peril)
+        else:
+            peril_missing.append(peril)
+    used_unknown_hazard_fallback = len(peril_missing) > 0
 
     return {
         "location": {
@@ -915,6 +956,14 @@ def score_resilience(
         },
         "hazards": hazard_response,
         "structural": structural_used,
+        "hazard_versions_used": hazard_versions_used,
+        "scoring_version": SCORING_VERSION,
+        "code_version": settings.code_version,
+        "data_quality": {
+            "peril_present": peril_present,
+            "peril_missing": peril_missing,
+            "used_unknown_hazard_fallback": used_unknown_hazard_fallback,
+        },
         "result": result,
     }
 
@@ -961,6 +1010,7 @@ def create_resilience_scores(
             if latest:
                 version_ids.append(latest)
 
+    hazard_versions_used = build_hazard_versions(db, user.tenant_id, version_ids)
     run = Run(
         tenant_id=user.tenant_id,
         run_type=RunType.RESILIENCE_SCORE,
@@ -980,7 +1030,10 @@ def create_resilience_scores(
         tenant_id=user.tenant_id,
         exposure_version_id=payload.exposure_version_id,
         run_id=run.id,
+        scoring_version=SCORING_VERSION,
+        code_version=settings.code_version,
         hazard_dataset_version_ids_json=version_ids,
+        hazard_versions_json=hazard_versions_used,
         scoring_config_json=payload.config,
     )
     db.add(result)
@@ -1061,6 +1114,9 @@ def get_resilience_score_summary(
         "avg": float(summary.avg) if summary.avg is not None else None,
         "min": int(summary.min) if summary.min is not None else None,
         "max": int(summary.max) if summary.max is not None else None,
+        "scoring_version": result.scoring_version,
+        "code_version": result.code_version,
+        "hazard_versions_used": result.hazard_versions_json,
         "buckets": {
             "0_19": int(summary.bucket_0_19 or 0),
             "20_39": int(summary.bucket_20_39 or 0),
@@ -1074,6 +1130,9 @@ def get_resilience_score_summary(
         "without_structural_count": output_refs.get("without_structural_count"),
         "with_structural": output_refs.get("with_structural_count"),
         "without_structural": output_refs.get("without_structural_count"),
+        "peril_coverage": output_refs.get("peril_coverage"),
+        "unknown_hazard_fallback_used_count": output_refs.get("unknown_hazard_fallback_used_count"),
+        "missing_tiv_count": output_refs.get("missing_tiv_count"),
     }
 
 
@@ -1175,6 +1234,9 @@ def disclosure_resilience_scores(
     if group_by and group_by not in allowed_groups:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid group_by")
 
+    run = db.get(Run, result.run_id) if result.run_id else None
+    output_refs = run.output_refs_json if run and run.output_refs_json else {}
+
     bucket_cases = [
         ("0_19", ResilienceScoreItem.resilience_score <= 19),
         ("20_39", ResilienceScoreItem.resilience_score.between(20, 39)),
@@ -1212,14 +1274,28 @@ def disclosure_resilience_scores(
         weighted_avg = None
         if total_tiv_value > 0:
             weighted_avg = float(row.score_tiv or 0) / total_tiv_value
+        bucket_counts = {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases}
+        bucket_tiv = {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases}
+        percent_locations = compute_bucket_percentages(bucket_counts, int(row.total_locations or 0))
+        percent_tiv = None
+        if total_tiv_value > 0:
+            percent_tiv = compute_bucket_percentages(bucket_tiv, total_tiv_value)
         return {
             "resilience_score_result_id": result.id,
             "total_locations": int(row.total_locations or 0),
             "total_tiv": total_tiv_value,
-            "bucket_counts": {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases},
-            "bucket_tiv": {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases},
+            "bucket_counts": bucket_counts,
+            "bucket_tiv": bucket_tiv,
             "weighted_avg_score": weighted_avg,
             "missing_tiv_count": int(row.missing_tiv_count or 0),
+            "scoring_version": result.scoring_version,
+            "code_version": result.code_version,
+            "hazard_versions_used": result.hazard_versions_json,
+            "peril_coverage": output_refs.get("peril_coverage"),
+            "disclosure_percentages": {
+                "bucket_percent_locations": percent_locations,
+                "bucket_percent_tiv": percent_tiv,
+            },
         }
 
     group_col = getattr(Location, group_by)
@@ -1232,19 +1308,33 @@ def disclosure_resilience_scores(
         weighted_avg = None
         if total_tiv_value > 0:
             weighted_avg = float(row.score_tiv or 0) / total_tiv_value
+        bucket_counts = {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases}
+        bucket_tiv = {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases}
+        percent_locations = compute_bucket_percentages(bucket_counts, int(row.total_locations or 0))
+        percent_tiv = None
+        if total_tiv_value > 0:
+            percent_tiv = compute_bucket_percentages(bucket_tiv, total_tiv_value)
         groups.append(
             {
                 "group_key": row.group_key,
                 "total_locations": int(row.total_locations or 0),
                 "total_tiv": total_tiv_value,
-                "bucket_counts": {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases},
-                "bucket_tiv": {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases},
+                "bucket_counts": bucket_counts,
+                "bucket_tiv": bucket_tiv,
                 "weighted_avg_score": weighted_avg,
+                "disclosure_percentages": {
+                    "bucket_percent_locations": percent_locations,
+                    "bucket_percent_tiv": percent_tiv,
+                },
             }
         )
     return {
         "resilience_score_result_id": result.id,
         "group_by": group_by,
+        "scoring_version": result.scoring_version,
+        "code_version": result.code_version,
+        "hazard_versions_used": result.hazard_versions_json,
+        "peril_coverage": output_refs.get("peril_coverage"),
         "top_groups": groups,
     }
 

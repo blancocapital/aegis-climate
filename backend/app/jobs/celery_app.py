@@ -40,7 +40,8 @@ from app.services.commit import canonicalize_rows, to_location_dict
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.quality import quality_scores
-from app.services.resilience import compute_resilience_score
+from app.services.quality_metrics import init_peril_coverage, update_peril_coverage
+from app.services.resilience import DEFAULT_WEIGHTS, compute_resilience_score
 from app.services.structural import normalize_structural
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
@@ -577,6 +578,10 @@ def compute_resilience_scores(
         skipped_missing_coords = 0
         with_structural_count = 0
         without_structural_count = 0
+        unknown_hazard_fallback_used_count = 0
+        missing_tiv_count = 0
+        perils = list(DEFAULT_WEIGHTS.keys())
+        peril_coverage = init_peril_coverage(perils)
         batch_size = 1000
         batch: List[ResilienceScoreItem] = []
         version_ids = hazard_dataset_version_ids or []
@@ -585,6 +590,8 @@ def compute_resilience_scores(
             if loc.latitude is None or loc.longitude is None:
                 skipped_missing_coords += 1
                 continue
+            if loc.tiv is None:
+                missing_tiv_count += 1
             structural = normalize_structural(loc.structural_json)
             if structural:
                 with_structural_count += 1
@@ -616,6 +623,13 @@ def compute_resilience_scores(
                         version.version_label,
                     )
                     merge_worst_in_peril(hazards, entry, tie_breaker_id=feature.id)
+            update_peril_coverage(peril_coverage, hazards, perils)
+            fallback_used = any(
+                peril not in hazards or hazards.get(peril, {}).get("score") is None
+                for peril in perils
+            )
+            if fallback_used:
+                unknown_hazard_fallback_used_count += 1
 
             normalized_hazards = {
                 peril: {k: v for k, v in entry.items() if k != "_tie_breaker_id"}
@@ -654,6 +668,9 @@ def compute_resilience_scores(
             "skipped_missing_coords": skipped_missing_coords,
             "with_structural_count": with_structural_count,
             "without_structural_count": without_structural_count,
+            "peril_coverage": peril_coverage,
+            "unknown_hazard_fallback_used_count": unknown_hazard_fallback_used_count,
+            "missing_tiv_count": missing_tiv_count,
         }
         run.code_version = settings.code_version
         session.commit()

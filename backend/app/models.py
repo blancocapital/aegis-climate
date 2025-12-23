@@ -310,7 +310,10 @@ class ResilienceScoreResult(Base):
     tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
     exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
     run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+    scoring_version = Column(String, nullable=False, default="v1")
+    code_version = Column(String, nullable=True)
     hazard_dataset_version_ids_json = Column(JSON, nullable=True)
+    hazard_versions_json = Column(JSON, nullable=True)
     scoring_config_json = Column(JSON, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

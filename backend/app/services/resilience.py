@@ -1,5 +1,7 @@
 from typing import Any, Dict, Optional
 
+SCORING_VERSION = "v1"
+
 DEFAULT_WEIGHTS = {
     "flood": 0.35,
     "wildfire": 0.35,
@@ -106,4 +108,5 @@ def compute_resilience_score(
         "peril_scores": peril_scores,
         "structural_adjustments": structural_adjustments,
         "warnings": warnings,
+        "scoring_version": SCORING_VERSION,
     }
