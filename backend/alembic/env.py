@@ -1,7 +1,7 @@
 from logging.config import fileConfig
 import os
 import sys
-from sqlalchemy import Column, MetaData, String, Table, engine_from_config, pool
+from sqlalchemy import engine_from_config, pool
 from alembic import context
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -41,13 +41,6 @@ def run_migrations_online():
     )
 
     with connectable.connect() as connection:
-        version_table = Table(
-            "alembic_version",
-            MetaData(),
-            Column("version_num", String(64), primary_key=True),
-        )
-        version_table.create(connection, checkfirst=True)
-
         context.configure(connection=connection, target_metadata=target_metadata)
 
         with context.begin_transaction():

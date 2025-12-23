@@ -1,6 +1,6 @@
 """hazard registry and overlay tables
 
-Revision ID: 0007_hazard_registry_and_overlays
+Revision ID: 0007_hazard_registry_overlay
 Revises: 0006_run_overlay_enum
 Create Date: 2024-05-02
 """
@@ -13,7 +13,7 @@ from geoalchemy2 import Geometry
 
 
 # revision identifiers, used by Alembic.
-revision: str = "0007_hazard_registry_and_overlays"
+revision: str = "0007_hazard_registry_overlay"
 down_revision: Union[str, None] = "0006_run_overlay_enum"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

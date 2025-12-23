@@ -1,7 +1,7 @@
 """
 Add request fingerprint to resilience score results
 
-Revision ID: 0021_resilience_score_request_fingerprint
+Revision ID: 0021_res_score_request_fp
 Revises: 0020_property_profile_table
 Create Date: 2024-01-01 00:00:21
 """
@@ -11,7 +11,7 @@ import json
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0021_resilience_score_request_fingerprint"
+revision = "0021_res_score_request_fp"
 down_revision = "0020_property_profile_table"
 branch_labels = None
 depends_on = None

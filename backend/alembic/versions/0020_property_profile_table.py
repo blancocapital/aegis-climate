@@ -2,14 +2,14 @@
 Add property profile table
 
 Revision ID: 0020_property_profile_table
-Revises: 0019_run_property_enrichment_enum
+Revises: 0019_property_enrich_enum
 Create Date: 2024-01-01 00:00:20
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "0020_property_profile_table"
-down_revision = "0019_run_property_enrichment_enum"
+down_revision = "0019_property_enrich_enum"
 branch_labels = None
 depends_on = None
 
