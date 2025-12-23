@@ -14,7 +14,7 @@ import { Button } from './ui/button'
 
 interface DataTableProps<TData> {
   data: TData[]
-  columns: ColumnDef<TData, any>[]
+  columns: ColumnDef<TData, unknown>[]
 }
 
 export function DataTable<TData>({ data, columns }: DataTableProps<TData>) {

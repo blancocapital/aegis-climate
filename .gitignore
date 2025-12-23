@@ -10,3 +10,5 @@ infra/minio-data
 
 repo.zip
 qa_*.log
+dist/
+frontend/dist/

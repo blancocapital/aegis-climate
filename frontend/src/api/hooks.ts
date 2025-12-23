@@ -23,6 +23,7 @@ import {
 } from './types'
 
 const pollingStatuses = ['QUEUED', 'RUNNING']
+type QueryParams = Record<string, string | number | boolean | null | undefined>
 
 export function useLogin() {
   return useMutation({
@@ -49,7 +50,7 @@ export function useUploadFile() {
 
 export function useCreateMapping(uploadId?: string) {
   return useMutation({
-    mutationFn: (payload: { name: string; mapping_json: Record<string, any> }) =>
+    mutationFn: (payload: { name: string; mapping_json: Record<string, unknown> }) =>
       apiRequest({ method: 'POST', path: `/uploads/${uploadId}/mapping`, body: payload }).then((res) =>
         MappingResponseSchema.parse(res)
       ),
@@ -73,10 +74,10 @@ export function useRun(runId?: number, enabled = true) {
     queryKey: ['run', runId],
     queryFn: () => apiRequest({ path: `/runs/${runId}` }).then((res) => RunSchema.parse(res)),
     enabled: Boolean(runId) && enabled,
-    refetchInterval: (data) =>
-      data && pollingStatuses.includes((data as any).status)
-        ? 1500
-        : false,
+    refetchInterval: (query) => {
+      const status = (query.state.data as { status?: string } | undefined)?.status
+      return status && pollingStatuses.includes(status) ? 1500 : false
+    },
     refetchIntervalInBackground: true,
   })
 }
@@ -91,7 +92,7 @@ export function useValidationResult(id?: number, params?: { limit?: number; offs
 
 export function useUnderwritingPacket() {
   return useMutation({
-    mutationFn: (payload: Record<string, any>) =>
+    mutationFn: (payload: Record<string, unknown>) =>
       apiRequestWithMeta({ method: 'POST', path: '/underwriting/packet', body: payload }).then(({ data, requestId }) => ({
         data: UnderwritingPacketResponseSchema.parse(data),
         requestId,
@@ -127,7 +128,7 @@ export function useExposureVersion(id?: string | number) {
   })
 }
 
-export function useExposureLocations(id?: string | number, params?: Record<string, any>) {
+export function useExposureLocations(id?: string | number, params?: QueryParams) {
   return useQuery({
     queryKey: ['exposure-locations', id, params],
     queryFn: () =>
@@ -206,10 +207,10 @@ export function useOverlayStatus(id?: number) {
     queryKey: ['overlay-status', id],
     queryFn: () => apiRequest({ path: `/hazard-overlays/${id}/status` }).then((res) => OverlayStatusSchema.parse(res)),
     enabled: Boolean(id),
-    refetchInterval: (data) =>
-      data && pollingStatuses.includes((data as any).status)
-        ? 1500
-        : false,
+    refetchInterval: (query) => {
+      const status = (query.state.data as { status?: string } | undefined)?.status
+      return status && pollingStatuses.includes(status) ? 1500 : false
+    },
     refetchIntervalInBackground: true,
   })
 }
@@ -234,7 +235,7 @@ export function useRollupConfigs() {
 
 export function useCreateRollupConfig() {
   return useMutation({
-    mutationFn: (payload: { name: string; dimensions_json: string[]; measures_json: Record<string, any>[]; filters_json?: Record<string, any> }) =>
+    mutationFn: (payload: { name: string; dimensions_json: string[]; measures_json: Record<string, unknown>[]; filters_json?: Record<string, unknown> }) =>
       apiRequest({ method: 'POST', path: '/rollup-configs', body: payload }).then((res) => RollupConfigSchema.parse(res)),
   })
 }
@@ -242,7 +243,10 @@ export function useCreateRollupConfig() {
 export function useCreateRollup() {
   return useMutation({
     mutationFn: (payload: { exposure_version_id: number; rollup_config_id: number; hazard_overlay_result_ids?: number[] }) =>
-      apiRequest({ method: 'POST', path: '/rollups', body: payload }).then((res) => ({ rollup_result_id: res.id, run_id: res.run_id })),
+      apiRequest<{ id: number; run_id: number }>({ method: 'POST', path: '/rollups', body: payload }).then((res) => ({
+        rollup_result_id: res.id,
+        run_id: res.run_id,
+      })),
   })
 }
 
@@ -277,12 +281,12 @@ export function useThresholdRules() {
 
 export function useCreateThresholdRule() {
   return useMutation({
-    mutationFn: (payload: { name: string; severity: string; rule_json: any; active?: boolean }) =>
+    mutationFn: (payload: { name: string; severity: string; rule_json: unknown; active?: boolean }) =>
       apiRequest({ method: 'POST', path: '/threshold-rules', body: payload }).then((res) => ThresholdRuleSchema.parse(res)),
   })
 }
 
-export function useBreaches(params?: Record<string, any>) {
+export function useBreaches(params?: QueryParams) {
   return useQuery({
     queryKey: ['breaches', params],
     queryFn: () =>
@@ -306,7 +310,7 @@ export function useUpdateBreachStatus() {
   })
 }
 
-export function useAuditEvents(params?: Record<string, any>) {
+export function useAuditEvents(params?: QueryParams) {
   return useQuery({
     queryKey: ['audit-events', params],
     queryFn: () =>

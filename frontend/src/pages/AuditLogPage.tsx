@@ -16,7 +16,7 @@ export function AuditLogPage() {
       header: 'Metadata',
       accessorKey: 'metadata',
       cell: ({ getValue }) => {
-        const value = getValue() as Record<string, any> | undefined
+        const value = getValue() as Record<string, unknown> | undefined
         return value ? JSON.stringify(value) : '-'
       },
     },

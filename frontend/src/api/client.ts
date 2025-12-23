@@ -5,16 +5,18 @@ const BASE_URL = API_URL.replace(/\/$/, '')
 
 export type HttpMethod = 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE'
 
+type QueryParamValue = string | number | boolean | null | undefined
+
 export type RequestOptions = {
   method?: HttpMethod
   path: string
-  body?: any
-  params?: Record<string, any>
+  body?: unknown
+  params?: Record<string, QueryParamValue>
   headers?: Record<string, string>
   isMultipart?: boolean
 }
 
-function buildUrl(path: string, params?: Record<string, any>) {
+function buildUrl(path: string, params?: Record<string, QueryParamValue>) {
   const url = new URL(path.startsWith('http') ? path : `${BASE_URL}${path}`)
   if (params) {
     Object.entries(params).forEach(([key, value]) => {
@@ -29,16 +31,28 @@ export function getToken() {
   return localStorage.getItem('token')
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
 async function readErrorMessage(response: Response) {
   const contentType = response.headers.get('content-type') || ''
   if (contentType.includes('application/json')) {
-    const data = await response.json()
+    const data = (await response.json()) as unknown
     if (typeof data === 'string') return data
-    if (data && typeof data === 'object') {
-      if (Array.isArray((data as any).detail)) {
-        return (data as any).detail.map((item: any) => item?.msg || item).join(', ')
+    if (isRecord(data)) {
+      const detail = data.detail
+      if (Array.isArray(detail)) {
+        return detail
+          .map((item) => {
+            if (isRecord(item) && 'msg' in item) {
+              return String(item.msg ?? item)
+            }
+            return String(item)
+          })
+          .join(', ')
       }
-      if ('detail' in data) return String((data as any).detail)
+      if (detail !== undefined) return String(detail)
     }
     return JSON.stringify(data)
   }
@@ -53,10 +67,11 @@ export async function apiRequest<T>({ method = 'GET', path, body, params, header
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...headers,
   }
+  const payload = body ? (isMultipart ? (body as BodyInit) : JSON.stringify(body)) : undefined
   const response = await fetch(url, {
     method,
     headers: finalHeaders,
-    body: body ? (isMultipart ? body : JSON.stringify(body)) : undefined,
+    body: payload,
   })
 
   if (response.status === 401) {
@@ -83,7 +98,14 @@ type ApiErrorPayload = {
   request_id?: string
   code?: string
   message?: string
-  details?: any
+  details?: unknown
+}
+
+type ApiError = Error & {
+  requestId?: string
+  code?: string
+  details?: unknown
+  status?: number
 }
 
 export async function apiRequestWithMeta<T>({
@@ -101,10 +123,11 @@ export async function apiRequestWithMeta<T>({
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...headers,
   }
+  const payload = body ? (isMultipart ? (body as BodyInit) : JSON.stringify(body)) : undefined
   const response = await fetch(url, {
     method,
     headers: finalHeaders,
-    body: body ? (isMultipart ? body : JSON.stringify(body)) : undefined,
+    body: payload,
   })
 
   const requestId = response.headers.get('X-Request-ID') || undefined
@@ -113,7 +136,7 @@ export async function apiRequestWithMeta<T>({
     localStorage.removeItem('token')
     toast.error('Session expired, please log in again')
     window.location.href = '/login'
-    const err: any = new Error('Unauthorized')
+    const err = new Error('Unauthorized') as ApiError
     err.requestId = requestId
     throw err
   }
@@ -133,7 +156,7 @@ export async function apiRequestWithMeta<T>({
     if (!message) {
       message = payload ? JSON.stringify(payload) : await readErrorMessage(response)
     }
-    const err: any = new Error(message || 'Request failed')
+    const err = new Error(message || 'Request failed') as ApiError
     err.requestId = payload?.request_id || requestId
     err.code = payload?.code
     err.details = payload?.details

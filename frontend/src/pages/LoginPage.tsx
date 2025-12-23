@@ -28,7 +28,7 @@ export function LoginPage() {
 
   useEffect(() => {
     if (token) navigate('/')
-  }, [token])
+  }, [token, navigate])
 
   const onSubmit = async (values: FormValues) => {
     setLoginError(null)

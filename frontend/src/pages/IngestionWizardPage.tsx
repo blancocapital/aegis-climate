@@ -38,16 +38,35 @@ export function IngestionWizardPage() {
   const commitRunQuery = useRun(commitRunId || undefined, Boolean(commitRunId))
   const navigate = useNavigate()
   const pollStatuses = useMemo(() => new Set(['QUEUED', 'RUNNING']), [])
+  const runStatus = runQuery.data?.status
+  const commitStatus = commitRunQuery.data?.status
+  const refetchRun = runQuery.refetch
+  const refetchCommitRun = commitRunQuery.refetch
 
   const mappingForm = useForm<MappingForm>({ resolver: zodResolver(mappingSchema), defaultValues: { name: 'Auto mapping', mapping_json: '' } })
-  const validationResultId = useMemo(() => {
-    return (
-      (runQuery.data?.output_refs as any)?.validation_result_id ||
-      (runQuery.data as any)?.output_refs_json?.validation_result_id ||
-      null
-    )
+  const outputRefs = useMemo(() => {
+    const output = runQuery.data?.output_refs ?? runQuery.data?.output_refs_json
+    if (output && typeof output === 'object') {
+      return output as Record<string, unknown>
+    }
+    return null
   }, [runQuery.data])
+  const validationResultId = useMemo(() => {
+    const value = outputRefs?.validation_result_id
+    return typeof value === 'number' ? value : null
+  }, [outputRefs])
   const validationResultQuery = useValidationResult(validationResultId || undefined)
+  const commitOutputRefs = useMemo(() => {
+    const output = commitRunQuery.data?.output_refs ?? commitRunQuery.data?.output_refs_json
+    if (output && typeof output === 'object') {
+      return output as Record<string, unknown>
+    }
+    return null
+  }, [commitRunQuery.data])
+  const commitExposureId = useMemo(() => {
+    const value = commitOutputRefs?.exposure_version_id
+    return typeof value === 'number' ? value : null
+  }, [commitOutputRefs])
 
   const handleFileChange = async (file?: File) => {
     if (!file) return
@@ -95,41 +114,44 @@ export function IngestionWizardPage() {
     if (!validationResultQuery.data) return
     const counts = validationResultQuery.data.summary || {}
     setStats(counts as Record<string, number>)
-    const runIssues: Issue[] = (validationResultQuery.data.issues || []).map((issue: any, idx: number) => ({
-      id: idx,
-      message: issue.message || issue.code || 'Issue',
-      severity: issue.severity || 'WARN',
-    }))
+    const runIssues: Issue[] = (validationResultQuery.data.issues || []).map((issue, idx) => {
+      const issueRecord = issue as Record<string, unknown>
+      const message =
+        typeof issueRecord.message === 'string'
+          ? issueRecord.message
+          : typeof issueRecord.code === 'string'
+            ? issueRecord.code
+            : 'Issue'
+      const severity = typeof issueRecord.severity === 'string' ? issueRecord.severity : 'WARN'
+      return { id: idx, message, severity }
+    })
     setIssues(runIssues)
   }, [validationResultQuery.data])
 
   useEffect(() => {
     if (!runId) return
-    const status = runQuery.data?.status
-    if (status && !pollStatuses.has(status)) return
+    if (runStatus && !pollStatuses.has(runStatus)) return
     const interval = setInterval(() => {
-      runQuery.refetch()
+      refetchRun()
     }, 1500)
     return () => clearInterval(interval)
-  }, [runId, runQuery.data?.status, runQuery.refetch, pollStatuses])
+  }, [runId, runStatus, refetchRun, pollStatuses])
 
   useEffect(() => {
     if (!commitRunId) return
-    const status = commitRunQuery.data?.status
-    if (status && !pollStatuses.has(status)) return
+    if (commitStatus && !pollStatuses.has(commitStatus)) return
     const interval = setInterval(() => {
-      commitRunQuery.refetch()
+      refetchCommitRun()
     }, 1500)
     return () => clearInterval(interval)
-  }, [commitRunId, commitRunQuery.data?.status, commitRunQuery.refetch, pollStatuses])
+  }, [commitRunId, commitStatus, refetchCommitRun, pollStatuses])
 
   useEffect(() => {
-    const id = (commitRunQuery.data?.output_refs as any)?.exposure_version_id
-    if (commitRunQuery.data?.status === 'SUCCEEDED' && id) {
+    if (commitStatus === 'SUCCEEDED' && commitExposureId) {
       toast.success('Exposure committed')
-      navigate(`/exposure-versions/${id}`)
+      navigate(`/exposure-versions/${commitExposureId}`)
     }
-  }, [commitRunQuery.data])
+  }, [commitStatus, commitExposureId, navigate])
 
   const issueColumns: ColumnDef<Issue>[] = [
     { header: 'Severity', accessorKey: 'severity' },
@@ -151,7 +173,7 @@ export function IngestionWizardPage() {
             </div>
             <input type="file" accept=".csv" onChange={(e) => handleFileChange(e.target.files?.[0])} />
           </div>
-          {uploadMutation.isLoading && <p className="text-sm">Uploading...</p>}
+          {uploadMutation.isPending && <p className="text-sm">Uploading...</p>}
         </Card>
 
         <Card className="space-y-3">
@@ -167,8 +189,8 @@ export function IngestionWizardPage() {
           <form className="space-y-2" onSubmit={mappingForm.handleSubmit(submitMapping)}>
             <Input placeholder="Name" {...mappingForm.register('name')} />
             <Textarea rows={6} {...mappingForm.register('mapping_json')} placeholder='{"external_location_id": "external_location_id"}' />
-            <Button type="submit" disabled={!uploadId || mappingMutation.isLoading}>
-              {mappingMutation.isLoading ? 'Saving...' : 'Save mapping'}
+            <Button type="submit" disabled={!uploadId || mappingMutation.isPending}>
+              {mappingMutation.isPending ? 'Saving...' : 'Save mapping'}
             </Button>
           </form>
         </Card>
@@ -179,8 +201,8 @@ export function IngestionWizardPage() {
               <p className="text-sm font-medium">Step 3 · Validate</p>
               <p className="text-xs text-slate-500">/uploads/{'{upload_id}'}/validate</p>
             </div>
-            <Button onClick={startValidation} disabled={!uploadId || validateMutation.isLoading}>
-              {validateMutation.isLoading ? 'Starting...' : 'Validate'}
+            <Button onClick={startValidation} disabled={!uploadId || validateMutation.isPending}>
+              {validateMutation.isPending ? 'Starting...' : 'Validate'}
             </Button>
           </div>
           {runId && (
@@ -213,9 +235,9 @@ export function IngestionWizardPage() {
             <Button
               variant="primary"
               onClick={startCommit}
-              disabled={!uploadId || !validationResultId || (stats.ERROR ?? 1) > 0 || commitMutation.isLoading}
+              disabled={!uploadId || !validationResultId || (stats.ERROR ?? 1) > 0 || commitMutation.isPending}
             >
-              {commitMutation.isLoading ? 'Starting...' : 'Commit'}
+              {commitMutation.isPending ? 'Starting...' : 'Commit'}
             </Button>
           </div>
           {commitRunId && (

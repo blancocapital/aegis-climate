@@ -76,8 +76,8 @@ export function OverlaysPage() {
           ))}
         </Select>
       </div>
-      <Button onClick={startOverlay} disabled={!exposureId || !selectedVersion || createOverlay.isLoading}>
-        {createOverlay.isLoading ? 'Starting...' : 'Start overlay'}
+      <Button onClick={startOverlay} disabled={!exposureId || !selectedVersion || createOverlay.isPending}>
+        {createOverlay.isPending ? 'Starting...' : 'Start overlay'}
       </Button>
       {overlayId && (
         <div className="space-y-2 text-sm">

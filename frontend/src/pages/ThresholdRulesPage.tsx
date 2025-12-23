@@ -23,7 +23,7 @@ export function ThresholdRulesPage() {
   ]
 
   const saveRule = async () => {
-    let parsed: any
+    let parsed: unknown
     try {
       parsed = JSON.parse(ruleJson)
     } catch (err) {
@@ -42,8 +42,8 @@ export function ThresholdRulesPage() {
         <Input value={severity} onChange={(e) => setSeverity(e.target.value)} placeholder="Severity" />
         <Textarea rows={3} value={ruleJson} onChange={(e) => setRuleJson(e.target.value)} />
       </div>
-      <Button onClick={saveRule} disabled={createRule.isLoading}>
-        {createRule.isLoading ? 'Creating...' : 'Create rule'}
+      <Button onClick={saveRule} disabled={createRule.isPending}>
+        {createRule.isPending ? 'Creating...' : 'Create rule'}
       </Button>
       <DataTable data={rules} columns={columns} />
     </Card>

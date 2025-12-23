@@ -61,8 +61,8 @@ export function HazardDatasetsPage() {
           <Input placeholder="Vendor" {...register('vendor')} />
           <Input placeholder="Coverage" {...register('coverage_geo')} />
           <Input placeholder="License ref" {...register('license_ref')} />
-          <Button type="submit" disabled={createDataset.isLoading}>
-            {createDataset.isLoading ? 'Creating...' : 'Create'}
+          <Button type="submit" disabled={createDataset.isPending}>
+            {createDataset.isPending ? 'Creating...' : 'Create'}
           </Button>
         </form>
         <DataTable data={datasets} columns={datasetColumns} />
@@ -74,7 +74,7 @@ export function HazardDatasetsPage() {
             <p className="text-sm text-slate-600">Upload GeoJSON to create a new version.</p>
           </div>
           <Button
-            variant="outline"
+            variant="secondary"
             disabled={!selected || !versions.data?.length}
             onClick={() => {
               if (!selected) return

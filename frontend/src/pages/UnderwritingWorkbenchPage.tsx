@@ -26,6 +26,37 @@ const decisionTone: Record<string, 'default' | 'success' | 'warn' | 'danger'> = 
   NEEDS_DATA: 'default',
 }
 
+type UnknownRecord = Record<string, unknown>
+
+function asRecord(value: unknown): UnknownRecord | null {
+  return value && typeof value === 'object' ? (value as UnknownRecord) : null
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
+}
+
+function asBoolean(value: unknown): boolean | undefined {
+  return typeof value === 'boolean' ? value : undefined
+}
+
+function asStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  return value.filter((item) => typeof item === 'string') as string[]
+}
+
+function formatValue(value: unknown): string {
+  if (value === null || value === undefined || value === '') return 'n/a'
+  if (typeof value === 'string' || typeof value === 'number') return String(value)
+  return JSON.stringify(value)
+}
+
+function getErrorInfo(error: unknown): { message: string; requestId?: string; code?: string } {
+  const record = asRecord(error) || {}
+  const message = asString(record.message) || 'Request failed'
+  return { message, requestId: asString(record.requestId), code: asString(record.code) }
+}
+
 function isQueued(response: UnderwritingPacketResponse | null): response is UnderwritingPacketQueued {
   return Boolean(response && (response as UnderwritingPacketQueued).status === 'ENRICHMENT_QUEUED')
 }
@@ -43,7 +74,7 @@ export function UnderwritingWorkbenchPage() {
   const [autoRetryCount, setAutoRetryCount] = useState(0)
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [showRawJson, setShowRawJson] = useState(false)
-  const [lastPayload, setLastPayload] = useState<Record<string, any> | null>(null)
+  const [lastPayload, setLastPayload] = useState<Record<string, unknown> | null>(null)
   const [form, setForm] = useState({
     address_line1: '',
     city: '',
@@ -59,45 +90,64 @@ export function UnderwritingWorkbenchPage() {
   const success = isSuccess(response) ? response : null
   const queued = isQueued(response) ? response : null
 
-  const hazards = (success?.hazards || {}) as Record<string, any>
   const hazardEntries = useMemo(() => {
-    return Object.entries(hazards).map(([peril, value]) => ({ peril, ...(value || {}) }))
-  }, [hazards])
+    const hazardRecord = asRecord(success?.hazards) || {}
+    return Object.entries(hazardRecord).map(([peril, value]) => ({
+      peril,
+      ...(asRecord(value) || {}),
+    }))
+  }, [success?.hazards])
 
-  const decision = success?.decision as Record<string, any> | undefined
-  const explainability = success?.explainability as Record<string, any> | undefined
-  const quality = (success?.quality || {}) as Record<string, any>
-  const nestedQuality = (quality?.data_quality || {}) as Record<string, any>
+  const decision = success?.decision ?? null
+  const explainability = success?.explainability ?? null
+  const quality = asRecord(success?.quality) || {}
+  const nestedQuality = asRecord(quality.data_quality) || {}
 
-  const enrichmentStatus = quality?.enrichment_status || nestedQuality?.enrichment_status
-  const enrichmentErrors = quality?.enrichment_errors || nestedQuality?.enrichment_errors
-  const completeness = quality?.completeness || nestedQuality?.completeness
-  const missingPerils = quality?.peril_missing || nestedQuality?.peril_missing
+  const enrichmentStatus = asString(quality.enrichment_status) || asString(nestedQuality.enrichment_status)
+  const enrichmentErrors = Array.isArray(quality.enrichment_errors)
+    ? quality.enrichment_errors
+    : Array.isArray(nestedQuality.enrichment_errors)
+      ? nestedQuality.enrichment_errors
+      : []
+  const completeness = asRecord(quality.completeness) || asRecord(nestedQuality.completeness)
+  const missingPerils = asStringArray(quality.peril_missing) || asStringArray(nestedQuality.peril_missing)
 
-  const hazardVersions =
-    (success?.provenance as Record<string, any> | undefined)?.hazard_versions_used ||
-    (success as Record<string, any> | undefined)?.hazard_versions_used ||
-    []
+  const hazardVersions = useMemo(() => {
+    const provenanceRecord = asRecord(success?.provenance)
+    if (Array.isArray(provenanceRecord?.hazard_versions_used)) {
+      return provenanceRecord?.hazard_versions_used
+    }
+    const responseRecord = asRecord(success)
+    return Array.isArray(responseRecord?.hazard_versions_used) ? responseRecord?.hazard_versions_used : []
+  }, [success])
 
-  const policyUsed = (success as Record<string, any> | undefined)?.policy_used
+  const policyUsed = asRecord(asRecord(success)?.policy_used)
 
   const decisionLabel = decision?.decision || (success?.decision === null ? 'NOT REQUESTED' : 'UNKNOWN')
   const confidencePct = Math.round(Math.max(0, Math.min(1, Number(decision?.confidence ?? 0))) * 100)
 
   const driverRows = Array.isArray(explainability?.drivers) ? explainability?.drivers : []
-  const sortedDrivers = [...driverRows].sort((a: any, b: any) => {
+  const sortedDrivers = [...driverRows].sort((a, b) => {
     const diff = Number(b?.contribution_pct ?? 0) - Number(a?.contribution_pct ?? 0)
     if (diff !== 0) return diff
     return String(a?.peril || '').localeCompare(String(b?.peril || ''))
   })
 
-  const structuralImpacts = Array.isArray(explainability?.structural_impacts)
-    ? explainability?.structural_impacts
-    : []
+  const structuralImpacts = useMemo(() => {
+    const record = asRecord(explainability)
+    return Array.isArray(record?.structural_impacts) ? record?.structural_impacts : []
+  }, [explainability])
 
   const stepStates = [
     { label: 'Resolve address', done: Boolean(response) },
-    { label: 'Enrich property', done: Boolean(success?.property?.property_profile_id || quality?.property_enriched || nestedQuality?.property_enriched) },
+    {
+      label: 'Enrich property',
+      done: Boolean(
+        asRecord(success?.property)?.property_profile_id ||
+          asBoolean(quality.property_enriched) ||
+          asBoolean(nestedQuality.property_enriched)
+      ),
+    },
     { label: 'Join hazards', done: hazardEntries.length > 0 },
     { label: 'Score', done: success?.resilience?.resilience_score !== undefined },
     { label: 'Decide', done: Boolean(decision?.decision) },
@@ -130,10 +180,10 @@ export function UnderwritingWorkbenchPage() {
         setLastPayload(payload)
         setAutoRetryCount(0)
       },
-      onError: (error: any) => {
-        const message = error?.message || 'Request failed'
-        setErrorInfo({ message, requestId: error?.requestId, code: error?.code })
-        toast.error(message)
+      onError: (error: unknown) => {
+        const info = getErrorInfo(error)
+        setErrorInfo(info)
+        toast.error(info.message)
       },
     })
   }
@@ -147,10 +197,10 @@ export function UnderwritingWorkbenchPage() {
         setRequestId(headerRequestId)
         setAutoRetryCount(0)
       },
-      onError: (error: any) => {
-        const message = error?.message || 'Request failed'
-        setErrorInfo({ message, requestId: error?.requestId, code: error?.code })
-        toast.error(message)
+      onError: (error: unknown) => {
+        const info = getErrorInfo(error)
+        setErrorInfo(info)
+        toast.error(info.message)
       },
     })
   }
@@ -178,10 +228,10 @@ export function UnderwritingWorkbenchPage() {
           setResponse(data)
           setRequestId(headerRequestId)
         },
-        onError: (error: any) => {
-          const message = error?.message || 'Request failed'
-          setErrorInfo({ message, requestId: error?.requestId, code: error?.code })
-          toast.error(message)
+        onError: (error: unknown) => {
+          const info = getErrorInfo(error)
+          setErrorInfo(info)
+          toast.error(info.message)
         },
       })
     }, AUTO_RETRY_DELAY_MS)
@@ -428,7 +478,7 @@ export function UnderwritingWorkbenchPage() {
                     <p className="text-xs font-semibold uppercase text-slate-500">Reason codes</p>
                     <div className="mt-2 flex flex-wrap gap-2">
                       {(decision?.reason_codes || []).length ? (
-                        decision?.reason_codes?.map((code: string) => <Badge key={code}>{code}</Badge>)
+                        decision?.reason_codes?.map((code) => <Badge key={code}>{code}</Badge>)
                       ) : (
                         <span className="text-sm text-slate-500">None</span>
                       )}
@@ -438,7 +488,7 @@ export function UnderwritingWorkbenchPage() {
                     <p className="text-xs font-semibold uppercase text-slate-500">Reasons</p>
                     <ul className="mt-2 space-y-1 text-sm text-slate-600">
                       {(decision?.reasons || []).length ? (
-                        decision?.reasons?.map((reason: string) => <li key={reason}>{reason}</li>)
+                        decision?.reasons?.map((reason) => <li key={reason}>{reason}</li>)
                       ) : (
                         <li>No reasons provided.</li>
                       )}
@@ -449,12 +499,17 @@ export function UnderwritingWorkbenchPage() {
                   <div>
                     <p className="text-xs font-semibold uppercase text-slate-500">Mitigation recommendations</p>
                     <div className="mt-2 grid gap-2 lg:grid-cols-2">
-                      {decision?.mitigation_recommendations?.map((rec: any, idx: number) => (
-                        <div key={`${rec?.code || 'rec'}-${idx}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
-                          <p className="text-sm font-semibold text-slate-700">{rec?.title || rec?.code}</p>
-                          <p className="text-sm text-slate-600">{rec?.detail}</p>
-                        </div>
-                      ))}
+                      {decision?.mitigation_recommendations?.map((rec, idx) => {
+                        const recRecord = asRecord(rec) || {}
+                        const title = asString(recRecord.title) || asString(recRecord.code) || 'Recommendation'
+                        const detail = asString(recRecord.detail) || ''
+                        return (
+                          <div key={`${recRecord.code || 'rec'}-${idx}`} className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <p className="text-sm font-semibold text-slate-700">{title}</p>
+                            <p className="text-sm text-slate-600">{detail}</p>
+                          </div>
+                        )
+                      })}
                     </div>
                   </div>
                 ) : null}
@@ -470,15 +525,21 @@ export function UnderwritingWorkbenchPage() {
                   <p className="text-xs font-semibold uppercase text-slate-500">Top drivers</p>
                   <div className="mt-2 grid gap-2 lg:grid-cols-2">
                     {sortedDrivers.length ? (
-                      sortedDrivers.slice(0, 4).map((driver: any, idx: number) => (
-                        <div key={`${driver?.peril || 'driver'}-${idx}`} className="rounded-lg border border-slate-200 bg-white p-3">
-                          <div className="flex items-center justify-between">
-                            <span className="text-sm font-semibold text-slate-700">{driver?.peril || 'Unknown'}</span>
-                            <Badge>{Math.round(Number(driver?.contribution_pct || 0) * 100)}%</Badge>
+                      sortedDrivers.slice(0, 4).map((driver, idx) => {
+                        const contribution =
+                          typeof driver?.contribution === 'number' ? driver.contribution : undefined
+                        const contributionText =
+                          contribution !== undefined ? contribution.toFixed(3) : formatValue(driver?.contribution)
+                        return (
+                          <div key={`${driver?.peril || 'driver'}-${idx}`} className="rounded-lg border border-slate-200 bg-white p-3">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm font-semibold text-slate-700">{driver?.peril || 'Unknown'}</span>
+                              <Badge>{Math.round(Number(driver?.contribution_pct || 0) * 100)}%</Badge>
+                            </div>
+                            <p className="text-xs text-slate-500">Contribution: {contributionText}</p>
                           </div>
-                          <p className="text-xs text-slate-500">Contribution: {(driver?.contribution || 0).toFixed?.(3) ?? driver?.contribution}</p>
-                        </div>
-                      ))
+                        )
+                      })
                     ) : (
                       <p className="text-sm text-slate-500">No driver data available.</p>
                     )}
@@ -488,12 +549,17 @@ export function UnderwritingWorkbenchPage() {
                   <p className="text-xs font-semibold uppercase text-slate-500">Structural impacts</p>
                   <div className="mt-2 space-y-2 text-sm text-slate-600">
                     {structuralImpacts.length ? (
-                      structuralImpacts.map((impact: any, idx: number) => (
-                        <div key={`impact-${idx}`} className="flex items-start justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 p-2">
-                          <span>{impact?.label || impact?.type || 'Impact'}</span>
-                          <Badge>{impact?.delta ?? impact?.value ?? 'n/a'}</Badge>
-                        </div>
-                      ))
+                      structuralImpacts.map((impact, idx) => {
+                        const impactRecord = asRecord(impact) || {}
+                        const label = asString(impactRecord.label) || asString(impactRecord.type) || 'Impact'
+                        const value = impactRecord.delta ?? impactRecord.value
+                        return (
+                          <div key={`impact-${idx}`} className="flex items-start justify-between gap-2 rounded-md border border-slate-200 bg-slate-50 p-2">
+                            <span>{label}</span>
+                            <Badge>{formatValue(value)}</Badge>
+                          </div>
+                        )
+                      })
                     ) : (
                       <p>No structural adjustments detected.</p>
                     )}
@@ -511,12 +577,15 @@ export function UnderwritingWorkbenchPage() {
                     <p className="text-xs font-semibold uppercase text-slate-500">Completeness</p>
                     <div className="mt-2 space-y-1 text-sm text-slate-600">
                       {completeness ? (
-                        Object.entries(completeness).map(([key, value]) => (
-                          <div key={key} className="flex items-center justify-between">
-                            <span>{key}</span>
-                            <Badge tone={value ? 'success' : 'warn'}>{value ? 'Yes' : 'No'}</Badge>
-                          </div>
-                        ))
+                        Object.entries(completeness).map(([key, value]) => {
+                          const isComplete = Boolean(value)
+                          return (
+                            <div key={key} className="flex items-center justify-between">
+                              <span>{key}</span>
+                              <Badge tone={isComplete ? 'success' : 'warn'}>{isComplete ? 'Yes' : 'No'}</Badge>
+                            </div>
+                          )
+                        })
                       ) : (
                         <p>No completeness data.</p>
                       )}
@@ -528,9 +597,11 @@ export function UnderwritingWorkbenchPage() {
                       <p>Status: {enrichmentStatus || 'Unknown'}</p>
                       {Array.isArray(enrichmentErrors) && enrichmentErrors.length ? (
                         <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-2 text-xs text-amber-700">
-                          {enrichmentErrors.map((err: any, idx: number) => (
-                            <p key={`err-${idx}`}>{err?.message || err?.code || 'Unknown enrichment error'}</p>
-                          ))}
+                          {enrichmentErrors.map((err, idx) => {
+                            const errRecord = asRecord(err) || {}
+                            const message = asString(errRecord.message) || asString(errRecord.code) || 'Unknown enrichment error'
+                            return <p key={`err-${idx}`}>{message}</p>
+                          })}
                         </div>
                       ) : null}
                       {Array.isArray(missingPerils) && missingPerils.length ? (
@@ -554,16 +625,19 @@ export function UnderwritingWorkbenchPage() {
                       </TR>
                     </THead>
                     <TBody>
-                      {hazardEntries.map((hazard) => (
-                        <TR key={hazard.peril}>
-                          <TD>{hazard.peril}</TD>
-                          <TD>{hazard.score ?? 'n/a'}</TD>
-                          <TD>{hazard.band ?? 'n/a'}</TD>
-                          <TD className="max-w-[240px] truncate" title={hazard.source || ''}>
-                            {hazard.source || 'n/a'}
-                          </TD>
-                        </TR>
-                      ))}
+                      {hazardEntries.map((hazard) => {
+                        const hazardRecord = asRecord(hazard) || {}
+                        return (
+                          <TR key={hazard.peril}>
+                            <TD>{hazard.peril}</TD>
+                            <TD>{formatValue(hazardRecord.score)}</TD>
+                            <TD>{formatValue(hazardRecord.band)}</TD>
+                            <TD className="max-w-[240px] truncate" title={formatValue(hazardRecord.source)}>
+                              {formatValue(hazardRecord.source)}
+                            </TD>
+                          </TR>
+                        )
+                      })}
                     </TBody>
                   </Table>
                 ) : (
@@ -573,15 +647,21 @@ export function UnderwritingWorkbenchPage() {
                   <div>
                     <p className="text-xs font-semibold uppercase text-slate-500">Hazard versions used</p>
                     <div className="mt-2 grid gap-2 lg:grid-cols-2">
-                      {hazardVersions.map((version: any) => (
-                        <div
-                          key={`${version?.hazard_dataset_id || 'dataset'}-${version?.hazard_dataset_version_id || 'version'}`}
-                          className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600"
-                        >
-                          <p className="font-semibold text-slate-700">{version?.hazard_dataset_name || version?.peril}</p>
-                          <p>Version: {version?.version_label || version?.hazard_dataset_version_id}</p>
-                        </div>
-                      ))}
+                      {hazardVersions.map((version) => {
+                        const versionRecord = asRecord(version) || {}
+                        const datasetId = formatValue(versionRecord.hazard_dataset_id)
+                        const versionId = formatValue(versionRecord.hazard_dataset_version_id)
+                        const datasetName = asString(versionRecord.hazard_dataset_name) || asString(versionRecord.peril) || 'n/a'
+                        return (
+                          <div
+                            key={`${datasetId}-${versionId}`}
+                            className="rounded-md border border-slate-200 bg-slate-50 p-2 text-xs text-slate-600"
+                          >
+                            <p className="font-semibold text-slate-700">{datasetName}</p>
+                            <p>Version: {asString(versionRecord.version_label) || versionId}</p>
+                          </div>
+                        )
+                      })}
                     </div>
                   </div>
                 ) : null}
@@ -603,11 +683,11 @@ export function UnderwritingWorkbenchPage() {
                   </div>
                   <div>
                     <p className="text-xs font-semibold uppercase text-slate-500">Policy</p>
-                    <p>{policyUsed?.version_label || policyUsed?.policy_pack_version_id || 'default'}</p>
+                    <p>{formatValue(policyUsed?.version_label || policyUsed?.policy_pack_version_id || 'default')}</p>
                   </div>
                   <div>
                     <p className="text-xs font-semibold uppercase text-slate-500">Property profile</p>
-                    <p>{success?.property?.property_profile_id || 'n/a'}</p>
+                    <p>{formatValue(asRecord(success?.property)?.property_profile_id)}</p>
                   </div>
                 </div>
               </Card>

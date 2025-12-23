@@ -80,8 +80,8 @@ export function BreachesPage() {
           value={rollupResultId?.toString() || ''}
           onChange={(e) => setRollupResultId(e.target.value ? Number(e.target.value) : null)}
         />
-        <Button onClick={triggerEval} disabled={!ruleId || !rollupResultId || runEval.isLoading}>
-          {runEval.isLoading ? 'Running...' : 'Run evaluation'}
+        <Button onClick={triggerEval} disabled={!ruleId || !rollupResultId || runEval.isPending}>
+          {runEval.isPending ? 'Running...' : 'Run evaluation'}
         </Button>
       </div>
       <DataTable data={breaches} columns={columns} />

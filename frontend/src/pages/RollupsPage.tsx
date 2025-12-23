@@ -9,6 +9,7 @@ import { Textarea } from '../components/ui/textarea'
 import { Select } from '../components/ui/select'
 import { Badge } from '../components/ui/badge'
 import { toast } from 'sonner'
+import type { RollupConfig, RollupRow } from '../api/types'
 
 export function RollupsPage() {
   const { data: configs = [], refetch } = useRollupConfigs()
@@ -26,33 +27,41 @@ export function RollupsPage() {
   const [drillKeyB64, setDrillKeyB64] = useState<string>('')
   const drillQuery = useRollupDrilldown(rollupId || undefined, drillKeyB64)
 
-  const configColumns: ColumnDef<any>[] = [
+  const configColumns: ColumnDef<RollupConfig>[] = [
     { header: 'ID', accessorKey: 'id' },
     { header: 'Name', accessorKey: 'name' },
   ]
 
-  const rollupColumns: ColumnDef<any>[] = [
+  const rollupColumns: ColumnDef<RollupRow>[] = [
     { header: 'Key', accessorKey: 'rollup_key' },
     { header: 'Metrics', accessorKey: 'metrics', cell: ({ getValue }) => JSON.stringify(getValue()) },
   ]
 
   const saveConfig = async () => {
-    let parsed: any
+    let parsed: unknown
     try {
       parsed = JSON.parse(configJson)
     } catch (err) {
       toast.error('Config JSON is invalid')
       return
     }
-    if (!Array.isArray(parsed.dimensions) || !Array.isArray(parsed.measures)) {
+    if (!parsed || typeof parsed !== 'object') {
+      toast.error('Config JSON is invalid')
+      return
+    }
+    const parsedRecord = parsed as Record<string, unknown>
+    const dimensions = parsedRecord.dimensions
+    const measures = parsedRecord.measures
+    const filters = parsedRecord.filters
+    if (!Array.isArray(dimensions) || !Array.isArray(measures)) {
       toast.error('Config must include dimensions and measures arrays')
       return
     }
     await createConfig.mutateAsync({
       name,
-      dimensions_json: parsed.dimensions,
-      measures_json: parsed.measures,
-      filters_json: parsed.filters || undefined,
+      dimensions_json: dimensions as string[],
+      measures_json: measures as Record<string, unknown>[],
+      filters_json: (filters as Record<string, unknown>) || undefined,
     })
     refetch()
   }
@@ -92,8 +101,8 @@ export function RollupsPage() {
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Config name" />
           <Textarea rows={4} value={configJson} onChange={(e) => setConfigJson(e.target.value)} />
         </div>
-        <Button onClick={saveConfig} disabled={createConfig.isLoading}>
-          {createConfig.isLoading ? 'Saving...' : 'Save config'}
+        <Button onClick={saveConfig} disabled={createConfig.isPending}>
+          {createConfig.isPending ? 'Saving...' : 'Save config'}
         </Button>
         <DataTable data={configs} columns={configColumns} />
       </Card>
@@ -121,8 +130,8 @@ export function RollupsPage() {
             value={overlayIds}
             onChange={(e) => setOverlayIds(e.target.value)}
           />
-          <Button onClick={startRollup} disabled={!selectedConfig || !selectedExposure || createRollup.isLoading}>
-            {createRollup.isLoading ? 'Starting...' : 'Start rollup'}
+          <Button onClick={startRollup} disabled={!selectedConfig || !selectedExposure || createRollup.isPending}>
+            {createRollup.isPending ? 'Starting...' : 'Start rollup'}
           </Button>
         </div>
         {rollupId && (
@@ -133,7 +142,11 @@ export function RollupsPage() {
               <Input placeholder="Drilldown key JSON" value={drillKeyJson} onChange={(e) => setDrillKeyJson(e.target.value)} />
               <Button onClick={requestDrilldown}>Drilldown</Button>
             </div>
-            {drillQuery.data && <pre className="rounded bg-slate-900 p-3 text-xs text-slate-100">{JSON.stringify(drillQuery.data, null, 2)}</pre>}
+            {Boolean(drillQuery.data) && (
+              <pre className="rounded bg-slate-900 p-3 text-xs text-slate-100">
+                {JSON.stringify(drillQuery.data, null, 2)}
+              </pre>
+            )}
           </div>
         )}
       </Card>
