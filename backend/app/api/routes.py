@@ -179,9 +179,37 @@ def summarize_property_profile(profile: Optional[PropertyProfile]) -> Optional[D
     }
 
 
+DEFAULT_POLICY_META = {
+    "policy_pack_id": None,
+    "policy_pack_version_id": None,
+    "version_label": "default",
+    "policy_pack_name": "default",
+}
+
+
 def compute_structural_completeness(structural: Optional[Dict[str, Any]]) -> Dict[str, bool]:
     structural = structural or {}
     return {key: structural.get(key) is not None for key in STRUCTURAL_KEYS}
+
+
+def build_policy_used_snapshot(policy_meta: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = dict(policy_meta)
+    snapshot["scoring_version"] = SCORING_VERSION
+    snapshot["code_version"] = settings.code_version
+    return snapshot
+
+
+def resolve_policy_used_meta(
+    db: Session,
+    tenant_id: str,
+    policy_pack_version_id: Optional[int],
+    fallback: Dict[str, Any],
+) -> Dict[str, Any]:
+    try:
+        _, _, meta = resolve_policy_version(db, tenant_id, policy_pack_version_id)
+        return meta
+    except ValueError:
+        return fallback
 
 
 class MappingRequest(BaseModel):
@@ -199,6 +227,10 @@ class PolicyPackVersionCreate(BaseModel):
     version_label: str
     scoring_config_json: Optional[Dict[str, Any]] = None
     underwriting_policy_json: Optional[Dict[str, Any]] = None
+
+
+class TenantDefaultPolicyRequest(BaseModel):
+    policy_pack_version_id: Optional[int] = None
 
 
 class HazardDatasetCreate(BaseModel):
@@ -517,6 +549,35 @@ def list_policy_pack_versions(
             for version in versions
         ]
     }
+
+
+@router.patch("/tenants/me/default-policy")
+def set_tenant_default_policy(
+    payload: TenantDefaultPolicyRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    tenant = db.get(Tenant, user.tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    if payload.policy_pack_version_id is None:
+        tenant.default_policy_pack_version_id = None
+        db.commit()
+        emit_audit(db, user.tenant_id, user.user_id, "tenant_default_policy_cleared")
+        return {"tenant_id": tenant.id, "default_policy_pack_version_id": None}
+    version = db.get(PolicyPackVersion, payload.policy_pack_version_id)
+    if not version or version.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy pack version not found")
+    tenant.default_policy_pack_version_id = version.id
+    db.commit()
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "tenant_default_policy_set",
+        {"policy_pack_version_id": version.id},
+    )
+    return {"tenant_id": tenant.id, "default_policy_pack_version_id": version.id}
 
 
 @router.post("/uploads/{upload_id}/validate")
@@ -1842,6 +1903,12 @@ def list_resilience_scores(
     items = []
     for result, run in rows:
         status_value = run.status.value if run and hasattr(run.status, "value") else (run.status if run else None)
+        policy_used = result.policy_used_json or resolve_policy_used_meta(
+            db,
+            user.tenant_id,
+            result.policy_pack_version_id,
+            DEFAULT_POLICY_META,
+        )
         items.append(
             {
                 "id": result.id,
@@ -1849,7 +1916,7 @@ def list_resilience_scores(
                 "scoring_version": result.scoring_version,
                 "code_version": result.code_version,
                 "hazard_versions_used": result.hazard_versions_json,
-                "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+                "policy_used": policy_used,
                 "policy_pack_version_id": result.policy_pack_version_id,
                 "status": status_value,
                 "run_id": result.run_id,
@@ -1909,6 +1976,7 @@ def create_resilience_scores(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     scoring_config_used = merge_policy_overrides(scoring_config, payload.config or {})
+    resolved_policy_pack_version_id = policy_meta.get("policy_pack_version_id")
 
     request_payload = {
         "tenant_id": user.tenant_id,
@@ -1917,7 +1985,7 @@ def create_resilience_scores(
         "config": scoring_config_used,
         "scoring_version": SCORING_VERSION,
         "code_version": settings.code_version,
-        "policy_pack_version_id": payload.policy_pack_version_id,
+        "policy_pack_version_id": resolved_policy_pack_version_id,
     }
     base_fingerprint = fingerprint_resilience_scores_request(
         user.tenant_id,
@@ -1926,7 +1994,7 @@ def create_resilience_scores(
         scoring_config_used,
         SCORING_VERSION,
         settings.code_version,
-        payload.policy_pack_version_id,
+        resolved_policy_pack_version_id,
     )
     request_json = dict(request_payload)
     now = datetime.utcnow()
@@ -1978,9 +2046,9 @@ def create_resilience_scores(
         input_refs_json={
             "exposure_version_id": payload.exposure_version_id,
             "hazard_dataset_version_ids": version_ids,
-            "policy_pack_version_id": payload.policy_pack_version_id,
+            "policy_pack_version_id": resolved_policy_pack_version_id,
         },
-        config_refs_json={"config": scoring_config_used, "policy_pack_version_id": payload.policy_pack_version_id},
+        config_refs_json={"config": scoring_config_used, "policy_pack_version_id": resolved_policy_pack_version_id},
         created_by=user.user_id,
         code_version=settings.code_version,
     )
@@ -1997,8 +2065,8 @@ def create_resilience_scores(
         hazard_dataset_version_ids_json=version_ids,
         hazard_versions_json=hazard_versions_used,
         scoring_config_json=scoring_config_used,
-        policy_pack_version_id=payload.policy_pack_version_id,
-        policy_used_json=policy_meta,
+        policy_pack_version_id=resolved_policy_pack_version_id,
+        policy_used_json=build_policy_used_snapshot(policy_meta),
         request_fingerprint=request_fingerprint,
         request_json=request_json,
     )
@@ -2104,7 +2172,18 @@ def get_resilience_score_summary(
 
     run = db.get(Run, result.run_id) if result.run_id else None
     output_refs = run.output_refs_json if run and run.output_refs_json else {}
-
+    policy_used = result.policy_used_json or resolve_policy_used_meta(
+        db,
+        user.tenant_id,
+        result.policy_pack_version_id,
+        DEFAULT_POLICY_META,
+    )
+    policy_used = result.policy_used_json or resolve_policy_used_meta(
+        db,
+        user.tenant_id,
+        result.policy_pack_version_id,
+        DEFAULT_POLICY_META,
+    )
     return {
         "resilience_score_result_id": result.id,
         "count": int(summary.count or 0),
@@ -2114,7 +2193,7 @@ def get_resilience_score_summary(
         "scoring_version": result.scoring_version,
         "code_version": result.code_version,
         "hazard_versions_used": result.hazard_versions_json,
-        "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+        "policy_used": policy_used,
         "policy_pack_version_id": result.policy_pack_version_id,
         "buckets": {
             "0_19": int(summary.bucket_0_19 or 0),
@@ -2251,6 +2330,12 @@ def disclosure_resilience_scores(
 
     run = db.get(Run, result.run_id) if result.run_id else None
     output_refs = run.output_refs_json if run and run.output_refs_json else {}
+    policy_used = result.policy_used_json or resolve_policy_used_meta(
+        db,
+        user.tenant_id,
+        result.policy_pack_version_id,
+        DEFAULT_POLICY_META,
+    )
 
     bucket_cases = [
         ("0_19", ResilienceScoreItem.resilience_score <= 19),
@@ -2306,7 +2391,7 @@ def disclosure_resilience_scores(
             "scoring_version": result.scoring_version,
             "code_version": result.code_version,
             "hazard_versions_used": result.hazard_versions_json,
-            "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+            "policy_used": policy_used,
             "policy_pack_version_id": result.policy_pack_version_id,
             "peril_coverage": output_refs.get("peril_coverage"),
             "disclosure_percentages": {
@@ -2351,7 +2436,7 @@ def disclosure_resilience_scores(
         "scoring_version": result.scoring_version,
         "code_version": result.code_version,
         "hazard_versions_used": result.hazard_versions_json,
-        "policy_used": result.policy_used_json or {"policy_pack_version_id": None, "version_label": "default"},
+        "policy_used": policy_used,
         "policy_pack_version_id": result.policy_pack_version_id,
         "peril_coverage": output_refs.get("peril_coverage"),
         "top_groups": groups,

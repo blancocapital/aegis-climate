@@ -56,6 +56,11 @@ class Tenant(Base):
     id = Column(String, primary_key=True)
     name = Column(String, nullable=False, unique=True)
     default_currency = Column(String, nullable=False, default="USD")
+    default_policy_pack_version_id = Column(
+        Integer,
+        ForeignKey("policy_pack_version.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 
 

@@ -157,6 +157,30 @@ def main() -> None:
         auth_headers = {"Authorization": f"Bearer {token}"}
         client.headers.update(auth_headers)
 
+        resp = client.post(
+            "/policy-packs",
+            json={"name": "QA Policy Pack", "description": "QA pack", "is_active": True},
+        )
+        if resp.status_code != 200:
+            _fail(f"policy pack create failed: {resp.status_code} {resp.text}")
+        pack_id = resp.json().get("id")
+        if not pack_id:
+            _fail("policy pack id missing")
+
+        resp = client.post(
+            f"/policy-packs/{pack_id}/versions",
+            json={
+                "version_label": "qa-v1",
+                "scoring_config_json": {"unknown_hazard_score": 0.1},
+                "underwriting_policy_json": {"score_accept_min": 90},
+            },
+        )
+        if resp.status_code != 200:
+            _fail(f"policy pack version create failed: {resp.status_code} {resp.text}")
+        policy_version_id = resp.json().get("id")
+        if not policy_version_id:
+            _fail("policy pack version id missing")
+
         address_payload = {
             "address_line1": "123 Main St",
             "city": "Metropolis",
@@ -201,6 +225,18 @@ def main() -> None:
             if key not in score_payload:
                 _fail(f"resilience score missing key: {key}")
         checklist.append("resilience_score")
+
+        default_score = score_payload.get("result", {}).get("resilience_score")
+        resp = client.post(
+            "/resilience/score",
+            json={**address_payload, "policy_pack_version_id": policy_version_id},
+        )
+        if resp.status_code != 200:
+            _fail(f"resilience score policy failed: {resp.status_code} {resp.text}")
+        policy_score = resp.json().get("result", {}).get("resilience_score")
+        if default_score == policy_score:
+            _fail("policy pack selection did not change resilience_score")
+        checklist.append("policy_score_variant")
 
         resp = client.post(
             "/property-profiles/resolve",
@@ -247,6 +283,25 @@ def main() -> None:
         if status_payload.get("status") != "SUCCEEDED":
             _fail(f"batch score did not succeed: {status_payload}")
 
+        resp = client.post(
+            "/resilience-scores",
+            json={"exposure_version_id": exposure_version_id, "policy_pack_version_id": policy_version_id},
+        )
+        if resp.status_code != 200:
+            _fail(f"batch score policy failed: {resp.status_code} {resp.text}")
+        policy_batch = resp.json()
+        policy_result_id = policy_batch.get("resilience_score_result_id")
+        if policy_result_id == result_id:
+            _fail("policy batch result should differ from default")
+        resp = client.post(
+            "/resilience-scores",
+            json={"exposure_version_id": exposure_version_id, "policy_pack_version_id": policy_version_id},
+        )
+        if resp.status_code != 200:
+            _fail(f"batch score policy repeat failed: {resp.status_code} {resp.text}")
+        repeat_policy = resp.json()
+        if repeat_policy.get("status") not in ("EXISTING_IN_PROGRESS", "EXISTING_SUCCEEDED"):
+            _fail(f"unexpected policy batch repeat status: {repeat_policy}")
         resp = client.get(f"/resilience-scores/{result_id}/summary")
         if resp.status_code != 200:
             _fail(f"summary failed: {resp.status_code} {resp.text}")
@@ -303,6 +358,9 @@ def main() -> None:
             "hazards_json",
             "structural_json",
             "input_structural_json",
+            "policy_pack_version_id",
+            "policy_used_json",
+            "policy_version_label",
         ]
         if header[: len(expected_cols)] != expected_cols:
             _fail(f"export header mismatch: {header}")

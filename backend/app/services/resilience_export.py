@@ -28,6 +28,7 @@ CSV_COLUMNS = [
     "input_structural_json",
     "policy_pack_version_id",
     "policy_used_json",
+    "policy_version_label",
 ]
 
 
@@ -66,6 +67,7 @@ def serialize_export_row(row: Dict[str, Any]) -> Dict[str, Any]:
         "input_structural_json": _serialize_json(row.get("input_structural_json")),
         "policy_pack_version_id": row.get("policy_pack_version_id"),
         "policy_used_json": _serialize_json(row.get("policy_used_json")),
+        "policy_version_label": row.get("policy_version_label") or "",
     }
 
 
@@ -106,6 +108,9 @@ def iter_resilience_export_rows(
         for item, location, result in rows:
             warnings = []
             input_structural = None
+            policy_version_label = None
+            if isinstance(result.policy_used_json, dict):
+                policy_version_label = result.policy_used_json.get("version_label")
             if isinstance(item.result_json, dict):
                 warnings = item.result_json.get("warnings") or []
                 input_structural = item.result_json.get("input_structural")
@@ -130,6 +135,7 @@ def iter_resilience_export_rows(
                     "input_structural_json": input_structural,
                     "policy_pack_version_id": result.policy_pack_version_id,
                     "policy_used_json": result.policy_used_json,
+                    "policy_version_label": policy_version_label or "default",
                 }
             )
             start_after_id = item.id
