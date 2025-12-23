@@ -231,6 +231,7 @@ class Location(Base):
     geocode_confidence = Column(Float, nullable=True)
     quality_tier = Column(String, nullable=True)
     quality_reasons_json = Column(JSON, nullable=True)
+    structural_json = Column(JSON, nullable=True)
     updated_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
 

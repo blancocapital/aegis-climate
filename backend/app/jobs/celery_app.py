@@ -41,6 +41,7 @@ from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.quality import quality_scores
 from app.services.resilience import compute_resilience_score
+from app.services.structural import normalize_structural
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.services.drift import COMPARE_FIELDS, compare_exposures
@@ -574,6 +575,8 @@ def compute_resilience_scores(
         ).all()
         scored = 0
         skipped_missing_coords = 0
+        with_structural_count = 0
+        without_structural_count = 0
         batch_size = 1000
         batch: List[ResilienceScoreItem] = []
         version_ids = hazard_dataset_version_ids or []
@@ -582,6 +585,11 @@ def compute_resilience_scores(
             if loc.latitude is None or loc.longitude is None:
                 skipped_missing_coords += 1
                 continue
+            structural = normalize_structural(loc.structural_json)
+            if structural:
+                with_structural_count += 1
+            else:
+                without_structural_count += 1
             hazards: Dict[str, Dict] = {}
             if version_ids:
                 geom_point = func.ST_SetSRID(func.ST_MakePoint(loc.longitude, loc.latitude), 4326)
@@ -613,7 +621,9 @@ def compute_resilience_scores(
                 peril: {k: v for k, v in entry.items() if k != "_tie_breaker_id"}
                 for peril, entry in hazards.items()
             }
-            result_payload = compute_resilience_score(normalized_hazards, {}, config)
+            result_payload = compute_resilience_score(normalized_hazards, structural, config)
+            result_with_input = dict(result_payload)
+            result_with_input["input_structural"] = structural
             batch.append(
                 ResilienceScoreItem(
                     tenant_id=tenant_id,
@@ -622,7 +632,7 @@ def compute_resilience_scores(
                     resilience_score=result_payload["resilience_score"],
                     risk_score=result_payload["risk_score"],
                     hazards_json=normalized_hazards,
-                    result_json=result_payload,
+                    result_json=result_with_input,
                 )
             )
             scored += 1
@@ -642,6 +652,8 @@ def compute_resilience_scores(
             "resilience_score_result_id": score_result_id,
             "scored": scored,
             "skipped_missing_coords": skipped_missing_coords,
+            "with_structural_count": with_structural_count,
+            "without_structural_count": without_structural_count,
         }
         run.code_version = settings.code_version
         session.commit()

@@ -8,6 +8,7 @@ from pydantic import BaseModel
 
 import jwt
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status, Header
+from fastapi.responses import StreamingResponse
 from sqlalchemy import case, func, select, or_, and_
 from sqlalchemy.orm import Session
 
@@ -49,7 +50,9 @@ from app.models import (
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.lineage import build_lineage
+from app.services.resilience_export import iter_resilience_export_rows
 from app.services.resilience import compute_resilience_score
+from app.services.structural import merge_structural, normalize_structural
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
@@ -113,6 +116,7 @@ class ResilienceStructural(BaseModel):
 
 
 class ResilienceScoreRequest(BaseModel):
+    location_id: Optional[int] = None
     lat: Optional[float] = None
     lon: Optional[float] = None
     address_line1: Optional[str] = None
@@ -122,6 +126,19 @@ class ResilienceScoreRequest(BaseModel):
     country: Optional[str] = None
     structural: Optional[ResilienceStructural] = None
     hazard_dataset_version_ids: Optional[List[int]] = None
+
+
+class LocationStructuralRequest(BaseModel):
+    structural: Optional[Dict[str, Any]] = None
+
+
+class ExposureStructuralItem(BaseModel):
+    external_location_id: str
+    structural: Optional[Dict[str, Any]] = None
+
+
+class ExposureStructuralBatchRequest(BaseModel):
+    items: List[ExposureStructuralItem]
 
 
 class ResilienceScoreBatchRequest(BaseModel):
@@ -485,6 +502,7 @@ def exposure_locations(exposure_version_id: int, user: TokenData = Depends(requi
     rows = db.execute(select(Location).where(Location.exposure_version_id == ev.id, Location.tenant_id == user.tenant_id)).scalars().all()
     return {"items": [
         {
+            "location_id": r.id,
             "external_location_id": r.external_location_id,
             "address_line1": r.address_line1,
             "city": r.city,
@@ -497,6 +515,65 @@ def exposure_locations(exposure_version_id: int, user: TokenData = Depends(requi
         }
         for r in rows
     ]}
+
+
+@router.patch("/locations/{location_id}/structural")
+def update_location_structural(
+    location_id: int,
+    payload: LocationStructuralRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    location = db.get(Location, location_id)
+    if not location or location.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    merged = merge_structural(location.structural_json, payload.structural)
+    location.structural_json = merged
+    location.updated_at = datetime.utcnow()
+    db.commit()
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "location_structural_updated",
+        {"location_id": location.id, "external_location_id": location.external_location_id},
+    )
+    return {"location_id": location.id, "structural_json": merged}
+
+
+@router.post("/exposure-versions/{exposure_version_id}/structural")
+def batch_update_structural(
+    exposure_version_id: int,
+    payload: ExposureStructuralBatchRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    updated = 0
+    not_found = 0
+    skipped_invalid = 0
+    for item in payload.items:
+        normalized_override = normalize_structural(item.structural)
+        if not normalized_override:
+            skipped_invalid += 1
+            continue
+        loc = db.execute(
+            select(Location).where(
+                Location.tenant_id == user.tenant_id,
+                Location.exposure_version_id == exposure_version_id,
+                Location.external_location_id == item.external_location_id,
+            )
+        ).scalar_one_or_none()
+        if not loc:
+            not_found += 1
+            continue
+        loc.structural_json = merge_structural(loc.structural_json, normalized_override)
+        loc.updated_at = datetime.utcnow()
+        updated += 1
+    db.commit()
+    return {"updated": updated, "not_found": not_found, "skipped_invalid": skipped_invalid}
 
 
 @router.get("/exposure-versions/{exposure_version_id}/exceptions")
@@ -723,22 +800,49 @@ def score_resilience(
     lon = payload.lon
     geocode_method = None
     geocode_confidence = None
-    if lat is None or lon is None:
-        if not (payload.address_line1 and payload.city and payload.country):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="lat/lon or address_line1, city, country required",
+    structural_override = payload.structural.dict() if payload.structural else None
+    structural_used: Dict[str, Any] = {}
+    if payload.location_id is not None:
+        location = db.get(Location, payload.location_id)
+        if not location or location.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Location not found")
+        lat = location.latitude
+        lon = location.longitude
+        if lat is None or lon is None:
+            if not (location.address_line1 and location.city and location.country):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="location_id missing coordinates and address",
+                )
+            lat, lon, geocode_confidence, geocode_method = geocode_address(
+                location.address_line1,
+                location.city,
+                location.country,
+                postal_code=location.postal_code or "",
+                state_region=location.state_region or "",
             )
-        lat, lon, geocode_confidence, geocode_method = geocode_address(
-            payload.address_line1,
-            payload.city,
-            payload.country,
-            postal_code=payload.postal_code or "",
-            state_region=payload.state_region or "",
-        )
+        else:
+            geocode_method = "PROVIDED"
+            geocode_confidence = 1.0
+        structural_used = merge_structural(location.structural_json, structural_override)
     else:
-        geocode_method = "PROVIDED"
-        geocode_confidence = 1.0
+        if lat is None or lon is None:
+            if not (payload.address_line1 and payload.city and payload.country):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="lat/lon or address_line1, city, country required",
+                )
+            lat, lon, geocode_confidence, geocode_method = geocode_address(
+                payload.address_line1,
+                payload.city,
+                payload.country,
+                postal_code=payload.postal_code or "",
+                state_region=payload.state_region or "",
+            )
+        else:
+            geocode_method = "PROVIDED"
+            geocode_confidence = 1.0
+        structural_used = normalize_structural(structural_override)
 
     version_ids: List[int] = []
     if payload.hazard_dataset_version_ids is not None:
@@ -796,8 +900,7 @@ def score_resilience(
             )
             merge_worst_in_peril(hazards, entry)
 
-    structural = payload.structural.dict() if payload.structural else {}
-    result = compute_resilience_score(hazards, structural, None)
+    result = compute_resilience_score(hazards, structural_used, None)
     hazard_response = {
         peril: {"score": data.get("score"), "band": data.get("band"), "source": data.get("source")}
         for peril, data in hazards.items()
@@ -811,6 +914,7 @@ def score_resilience(
             "geocode_confidence": geocode_confidence,
         },
         "hazards": hazard_response,
+        "structural": structural_used,
         "result": result,
     }
 
@@ -966,6 +1070,10 @@ def get_resilience_score_summary(
         },
         "scored": output_refs.get("scored"),
         "skipped_missing_coords": output_refs.get("skipped_missing_coords"),
+        "with_structural_count": output_refs.get("with_structural_count"),
+        "without_structural_count": output_refs.get("without_structural_count"),
+        "with_structural": output_refs.get("with_structural_count"),
+        "without_structural": output_refs.get("without_structural_count"),
     }
 
 
@@ -1018,6 +1126,127 @@ def list_resilience_score_items(
         )
 
     return {"items": items, "limit": limit, "offset": offset}
+
+
+@router.get("/resilience-scores/{resilience_score_result_id}/export.csv")
+def export_resilience_scores(
+    resilience_score_result_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+):
+    result = db.get(ResilienceScoreResult, resilience_score_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "resilience_scores_exported",
+        {"resilience_score_result_id": resilience_score_result_id},
+    )
+    generator = iter_resilience_export_rows(db, user.tenant_id, resilience_score_result_id)
+    return StreamingResponse(generator, media_type="text/csv")
+
+
+@router.get("/resilience-scores/{resilience_score_result_id}/disclosure")
+def disclosure_resilience_scores(
+    resilience_score_result_id: int,
+    group_by: Optional[str] = None,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    result = db.get(ResilienceScoreResult, resilience_score_result_id)
+    if not result or result.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+    allowed_groups = {"state_region", "postal_code", "lob"}
+    if group_by and group_by not in allowed_groups:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid group_by")
+
+    bucket_cases = [
+        ("0_19", ResilienceScoreItem.resilience_score <= 19),
+        ("20_39", ResilienceScoreItem.resilience_score.between(20, 39)),
+        ("40_59", ResilienceScoreItem.resilience_score.between(40, 59)),
+        ("60_79", ResilienceScoreItem.resilience_score.between(60, 79)),
+        ("80_100", ResilienceScoreItem.resilience_score >= 80),
+    ]
+
+    tiv_value = func.coalesce(Location.tiv, 0.0)
+    score_tiv = func.sum(ResilienceScoreItem.resilience_score * tiv_value).label("score_tiv")
+    total_tiv = func.sum(tiv_value).label("total_tiv")
+    missing_tiv = func.sum(case((Location.tiv.is_(None), 1), else_=0)).label("missing_tiv_count")
+
+    count_expr = func.count(ResilienceScoreItem.id).label("total_locations")
+    bucket_count_exprs = [
+        func.sum(case((cond, 1), else_=0)).label(f"count_{name}") for name, cond in bucket_cases
+    ]
+    bucket_tiv_exprs = [
+        func.sum(case((cond, tiv_value), else_=0)).label(f"tiv_{name}") for name, cond in bucket_cases
+    ]
+
+    base_query = (
+        select(count_expr, total_tiv, score_tiv, missing_tiv, *bucket_count_exprs, *bucket_tiv_exprs)
+        .select_from(ResilienceScoreItem)
+        .join(Location, ResilienceScoreItem.location_id == Location.id)
+        .where(
+            ResilienceScoreItem.tenant_id == user.tenant_id,
+            ResilienceScoreItem.resilience_score_result_id == result.id,
+        )
+    )
+
+    if not group_by:
+        row = db.execute(base_query).one()
+        total_tiv_value = float(row.total_tiv or 0)
+        weighted_avg = None
+        if total_tiv_value > 0:
+            weighted_avg = float(row.score_tiv or 0) / total_tiv_value
+        return {
+            "resilience_score_result_id": result.id,
+            "total_locations": int(row.total_locations or 0),
+            "total_tiv": total_tiv_value,
+            "bucket_counts": {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases},
+            "bucket_tiv": {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases},
+            "weighted_avg_score": weighted_avg,
+            "missing_tiv_count": int(row.missing_tiv_count or 0),
+        }
+
+    group_col = getattr(Location, group_by)
+    grouped_query = base_query.add_columns(group_col.label("group_key")).group_by(group_col)
+    grouped_query = grouped_query.order_by(total_tiv.desc()).limit(50)
+    rows = db.execute(grouped_query).all()
+    groups = []
+    for row in rows:
+        total_tiv_value = float(row.total_tiv or 0)
+        weighted_avg = None
+        if total_tiv_value > 0:
+            weighted_avg = float(row.score_tiv or 0) / total_tiv_value
+        groups.append(
+            {
+                "group_key": row.group_key,
+                "total_locations": int(row.total_locations or 0),
+                "total_tiv": total_tiv_value,
+                "bucket_counts": {name: int(getattr(row, f"count_{name}") or 0) for name, _ in bucket_cases},
+                "bucket_tiv": {name: float(getattr(row, f"tiv_{name}") or 0) for name, _ in bucket_cases},
+                "weighted_avg_score": weighted_avg,
+            }
+        )
+    return {
+        "resilience_score_result_id": result.id,
+        "group_by": group_by,
+        "top_groups": groups,
+    }
 
 
 @router.post("/hazard-overlays")
