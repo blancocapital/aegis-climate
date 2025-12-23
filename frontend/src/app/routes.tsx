@@ -15,6 +15,7 @@ import { RunsPage } from '../pages/RunsPage'
 import { AuditLogPage } from '../pages/AuditLogPage'
 import { AuthProvider } from '../auth/AuthProvider'
 import { NotFoundPage } from '../pages/NotFoundPage'
+import { UnderwritingWorkbenchPage } from '../pages/UnderwritingWorkbenchPage'
 
 export const router = createBrowserRouter([
   {
@@ -40,6 +41,7 @@ export const router = createBrowserRouter([
           { path: 'exposure-versions/:id', element: <ExposureVersionDetailPage /> },
           { path: 'exceptions', element: <ExceptionsPage /> },
           { path: 'hazard-datasets', element: <HazardDatasetsPage /> },
+          { path: 'underwriting', element: <UnderwritingWorkbenchPage /> },
           { path: 'overlays', element: <OverlaysPage /> },
           { path: 'rollups', element: <RollupsPage /> },
           { path: 'threshold-rules', element: <ThresholdRulesPage /> },

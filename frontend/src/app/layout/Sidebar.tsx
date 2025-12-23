@@ -3,6 +3,7 @@ import { cn } from '../../components/ui/utils'
 
 const navItems = [
   { to: '/ingestion', label: 'Ingestion' },
+  { to: '/underwriting', label: 'AI Underwriting' },
   { to: '/exposure-versions', label: 'Exposure Versions' },
   { to: '/exceptions', label: 'Exceptions' },
   { to: '/hazard-datasets', label: 'Hazard Datasets' },

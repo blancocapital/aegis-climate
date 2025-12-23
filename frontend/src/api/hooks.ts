@@ -1,5 +1,5 @@
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { apiRequest } from './client'
+import { apiRequest, apiRequestWithMeta } from './client'
 import { normalizeListResponse } from './normalize'
 import {
   AuditEventSchema,
@@ -19,6 +19,7 @@ import {
   ThresholdRuleSchema,
   UploadResponseSchema,
   ValidationResultSchema,
+  UnderwritingPacketResponseSchema,
 } from './types'
 
 const pollingStatuses = ['QUEUED', 'RUNNING']
@@ -85,6 +86,16 @@ export function useValidationResult(id?: number, params?: { limit?: number; offs
     queryKey: ['validation-result', id, params],
     queryFn: () => apiRequest({ path: `/validation-results/${id}`, params }).then((res) => ValidationResultSchema.parse(res)),
     enabled: Boolean(id),
+  })
+}
+
+export function useUnderwritingPacket() {
+  return useMutation({
+    mutationFn: (payload: Record<string, any>) =>
+      apiRequestWithMeta({ method: 'POST', path: '/underwriting/packet', body: payload }).then(({ data, requestId }) => ({
+        data: UnderwritingPacketResponseSchema.parse(data),
+        requestId,
+      })),
   })
 }
 

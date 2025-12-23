@@ -78,3 +78,72 @@ export async function apiRequest<T>({ method = 'GET', path, body, params, header
   // fallback text
   return (await response.text()) as T
 }
+
+type ApiErrorPayload = {
+  request_id?: string
+  code?: string
+  message?: string
+  details?: any
+}
+
+export async function apiRequestWithMeta<T>({
+  method = 'GET',
+  path,
+  body,
+  params,
+  headers = {},
+  isMultipart,
+}: RequestOptions): Promise<{ data: T; requestId?: string }> {
+  const token = getToken()
+  const url = buildUrl(path.startsWith('/api') ? path.replace('/api', '') : path, params)
+  const finalHeaders: Record<string, string> = {
+    ...(isMultipart ? {} : { 'Content-Type': 'application/json' }),
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...headers,
+  }
+  const response = await fetch(url, {
+    method,
+    headers: finalHeaders,
+    body: body ? (isMultipart ? body : JSON.stringify(body)) : undefined,
+  })
+
+  const requestId = response.headers.get('X-Request-ID') || undefined
+
+  if (response.status === 401) {
+    localStorage.removeItem('token')
+    toast.error('Session expired, please log in again')
+    window.location.href = '/login'
+    const err: any = new Error('Unauthorized')
+    err.requestId = requestId
+    throw err
+  }
+
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || ''
+    let payload: ApiErrorPayload | undefined
+    let message = ''
+    if (contentType.includes('application/json')) {
+      try {
+        payload = (await response.clone().json()) as ApiErrorPayload
+        message = payload?.message || ''
+      } catch (err) {
+        payload = undefined
+      }
+    }
+    if (!message) {
+      message = payload ? JSON.stringify(payload) : await readErrorMessage(response)
+    }
+    const err: any = new Error(message || 'Request failed')
+    err.requestId = payload?.request_id || requestId
+    err.code = payload?.code
+    err.details = payload?.details
+    err.status = response.status
+    throw err
+  }
+
+  const contentType = response.headers.get('content-type') || ''
+  if (contentType.includes('application/json')) {
+    return { data: (await response.json()) as T, requestId }
+  }
+  return { data: (await response.text()) as T, requestId }
+}

@@ -179,3 +179,51 @@ export const AuditEventSchema = z.object({
   created_at: z.string().optional(),
 })
 export type AuditEvent = z.infer<typeof AuditEventSchema>
+
+const UnderwritingDecisionSchema = z.object({
+  decision: z.string(),
+  confidence: z.number(),
+  reason_codes: z.array(z.string()).optional(),
+  reasons: z.array(z.string()).optional(),
+  mitigation_recommendations: z.array(z.record(z.any())).optional(),
+}).passthrough()
+
+const ExplainabilityDriverSchema = z.object({
+  peril: z.string(),
+  contribution_pct: z.number(),
+}).passthrough()
+
+const ExplainabilitySchema = z.object({
+  narrative: z.string(),
+  drivers: z.array(ExplainabilityDriverSchema),
+}).passthrough()
+
+const QualitySchema = z.object({
+  enrichment_status: z.string().optional(),
+  data_quality: z.object({ enrichment_status: z.string().optional() }).passthrough().optional(),
+}).passthrough()
+
+export const UnderwritingPacketSuccessSchema = z.object({
+  property: z.record(z.any()).optional(),
+  hazards: z.record(z.any()).optional(),
+  resilience: z.record(z.any()).optional(),
+  provenance: z.record(z.any()).optional(),
+  quality: QualitySchema.optional(),
+  decision: UnderwritingDecisionSchema.nullable().optional(),
+  explainability: ExplainabilitySchema,
+}).passthrough()
+export type UnderwritingPacketSuccess = z.infer<typeof UnderwritingPacketSuccessSchema>
+
+export const UnderwritingPacketQueuedSchema = z.object({
+  status: z.literal('ENRICHMENT_QUEUED'),
+  run_id: z.number(),
+  message: z.string().optional(),
+  address_fingerprint: z.string().optional(),
+}).passthrough()
+export type UnderwritingPacketQueued = z.infer<typeof UnderwritingPacketQueuedSchema>
+
+export const UnderwritingPacketResponseSchema = z.union([
+  UnderwritingPacketSuccessSchema,
+  UnderwritingPacketQueuedSchema,
+])
+export type UnderwritingPacketResponse = z.infer<typeof UnderwritingPacketResponseSchema>
