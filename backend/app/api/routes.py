@@ -8,7 +8,7 @@ from pydantic import BaseModel
 
 import jwt
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy import case, func, select, or_, and_
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,7 @@ from app.models import (
     Breach,
     ResilienceScoreResult,
     ResilienceScoreItem,
+    PropertyProfile,
 )
 from app.services.geocode import geocode_address
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
@@ -54,11 +55,20 @@ from app.services.quality_metrics import compute_bucket_percentages
 from app.services.resilience_export import iter_resilience_export_rows
 from app.services.resilience import DEFAULT_WEIGHTS, SCORING_VERSION, compute_resilience_score
 from app.services.structural import merge_structural, normalize_structural
+from app.services.property_enrichment import (
+    determine_enrich_mode,
+    normalize_address,
+    address_fingerprint,
+    providers_are_stub,
+    run_enrichment_pipeline,
+    is_profile_fresh,
+)
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
 from app.jobs.celery_app import breach_evaluate as breach_task
 from app.jobs.celery_app import compute_resilience_scores as resilience_score_task
+from app.jobs.celery_app import enrich_property_profile as enrich_property_profile_task
 
 router = APIRouter()
 settings = get_settings()
@@ -156,6 +166,8 @@ class ResilienceScoreRequest(BaseModel):
     country: Optional[str] = None
     structural: Optional[ResilienceStructural] = None
     hazard_dataset_version_ids: Optional[List[int]] = None
+    enrich: bool = True
+    enrich_mode: str = "auto"
 
 
 class LocationStructuralRequest(BaseModel):
@@ -169,6 +181,12 @@ class ExposureStructuralItem(BaseModel):
 
 class ExposureStructuralBatchRequest(BaseModel):
     items: List[ExposureStructuralItem]
+
+
+class PropertyProfileResolveRequest(BaseModel):
+    address: Dict[str, Any]
+    location_id: Optional[int] = None
+    force_refresh: bool = False
 
 
 class ResilienceScoreBatchRequest(BaseModel):
@@ -606,6 +624,105 @@ def batch_update_structural(
     return {"updated": updated, "not_found": not_found, "skipped_invalid": skipped_invalid}
 
 
+@router.post("/property-profiles/resolve")
+def resolve_property_profile(
+    payload: PropertyProfileResolveRequest,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    normalized = normalize_address(payload.address)
+    fingerprint = address_fingerprint(normalized)
+    existing = db.execute(
+        select(PropertyProfile).where(
+            PropertyProfile.tenant_id == user.tenant_id,
+            PropertyProfile.address_fingerprint == fingerprint,
+        )
+    ).scalar_one_or_none()
+    existing_id = None
+    if existing and not payload.force_refresh and is_profile_fresh(existing.updated_at):
+        existing_id = existing.id
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.PROPERTY_ENRICHMENT,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "address_fingerprint": fingerprint,
+            "location_id": payload.location_id,
+        },
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    db.add(run)
+    db.commit()
+    enrich_property_profile_task.delay(
+        run.id,
+        user.tenant_id,
+        payload.address,
+        payload.location_id,
+        payload.force_refresh,
+    )
+    return {
+        "run_id": run.id,
+        "property_profile_id": existing_id,
+        "status": "QUEUED",
+    }
+
+
+@router.get("/property-profiles/{property_profile_id}")
+def get_property_profile(
+    property_profile_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    profile = db.get(PropertyProfile, property_profile_id)
+    if not profile or profile.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    return {
+        "id": profile.id,
+        "location_id": profile.location_id,
+        "address_fingerprint": profile.address_fingerprint,
+        "standardized_address_json": profile.standardized_address_json,
+        "geocode_json": profile.geocode_json,
+        "parcel_json": profile.parcel_json,
+        "characteristics_json": profile.characteristics_json,
+        "structural_json": profile.structural_json,
+        "provenance_json": profile.provenance_json,
+        "code_version": profile.code_version,
+        "updated_at": profile.updated_at.isoformat() if profile.updated_at else None,
+    }
+
+
+@router.get("/property-profiles/runs/{run_id}/status")
+def get_property_profile_run_status(
+    run_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    run = db.get(Run, run_id)
+    if not run or run.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    status_value = run.status.value if hasattr(run.status, "value") else run.status
+    return {"run_id": run.id, "status": status_value, "output_refs": run.output_refs_json}
+
+
 @router.get("/exposure-versions/{exposure_version_id}/exceptions")
 def exposure_exceptions(exposure_version_id: int, user: TokenData = Depends(require_role(
     UserRole.ADMIN.value,
@@ -832,6 +949,11 @@ def score_resilience(
     geocode_confidence = None
     structural_override = payload.structural.dict() if payload.structural else None
     structural_used: Dict[str, Any] = {}
+    property_profile_id = None
+    property_profile_updated_at = None
+    property_enriched = False
+    structural_source = "payload"
+    hazard_versions_used = []
     if payload.location_id is not None:
         location = db.get(Location, payload.location_id)
         if not location or location.tenant_id != user.tenant_id:
@@ -855,24 +977,117 @@ def score_resilience(
             geocode_method = "PROVIDED"
             geocode_confidence = 1.0
         structural_used = merge_structural(location.structural_json, structural_override)
+        structural_source = "location"
+        if structural_override and normalize_structural(structural_override):
+            structural_source = "mixed"
     else:
-        if lat is None or lon is None:
-            if not (payload.address_line1 and payload.city and payload.country):
+        address_json = {
+            "address_line1": payload.address_line1,
+            "city": payload.city,
+            "state_region": payload.state_region,
+            "postal_code": payload.postal_code,
+            "country": payload.country,
+        }
+        address_present = payload.address_line1 and payload.city and payload.country
+        if address_present:
+            normalized_address = normalize_address(address_json)
+            fingerprint = address_fingerprint(normalized_address)
+            profile = db.execute(
+                select(PropertyProfile).where(
+                    PropertyProfile.tenant_id == user.tenant_id,
+                    PropertyProfile.address_fingerprint == fingerprint,
+                )
+            ).scalar_one_or_none()
+            if profile:
+                property_profile_id = profile.id
+                property_profile_updated_at = profile.updated_at.isoformat() if profile.updated_at else None
+                property_enriched = True
+                if lat is None or lon is None:
+                    geocode = profile.geocode_json or {}
+                    lat = geocode.get("lat")
+                    lon = geocode.get("lon")
+                    geocode_method = geocode.get("method")
+                    geocode_confidence = geocode.get("confidence")
+                structural_used = merge_structural(profile.structural_json, structural_override)
+                structural_source = "profile"
+                if structural_override and normalize_structural(structural_override):
+                    structural_source = "mixed"
+            else:
+                if not payload.enrich:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Property enrichment disabled and no profile exists",
+                    )
+                mode = determine_enrich_mode(payload.enrich_mode, providers_are_stub())
+                if mode == "async":
+                    run = Run(
+                        tenant_id=user.tenant_id,
+                        run_type=RunType.PROPERTY_ENRICHMENT,
+                        status=RunStatus.QUEUED,
+                        input_refs_json={"address_fingerprint": fingerprint},
+                        created_by=user.user_id,
+                        code_version=settings.code_version,
+                    )
+                    db.add(run)
+                    db.commit()
+                    enrich_property_profile_task.delay(
+                        run.id,
+                        user.tenant_id,
+                        address_json,
+                        None,
+                        False,
+                    )
+                    return JSONResponse(
+                        status_code=status.HTTP_202_ACCEPTED,
+                        content={
+                            "status": "ENRICHMENT_QUEUED",
+                            "run_id": run.id,
+                            "address_fingerprint": fingerprint,
+                            "message": "Enrichment queued. Retry /resilience/score with the same address or call GET /property-profiles/runs/{run_id}/status.",
+                        },
+                    )
+                payload_profile = run_enrichment_pipeline(address_json)
+                profile = PropertyProfile(
+                    tenant_id=user.tenant_id,
+                    address_fingerprint=payload_profile["address_fingerprint"],
+                    standardized_address_json=payload_profile["standardized_address_json"],
+                    geocode_json=payload_profile["geocode_json"],
+                    parcel_json=payload_profile["parcel_json"],
+                    characteristics_json=payload_profile["characteristics_json"],
+                    structural_json=payload_profile["structural_json"],
+                    provenance_json=payload_profile["provenance_json"],
+                    code_version=payload_profile["code_version"],
+                )
+                db.add(profile)
+                db.commit()
+                property_profile_id = profile.id
+                property_profile_updated_at = profile.updated_at.isoformat() if profile.updated_at else None
+                property_enriched = True
+                if lat is None or lon is None:
+                    geocode = profile.geocode_json or {}
+                    lat = geocode.get("lat")
+                    lon = geocode.get("lon")
+                    geocode_method = geocode.get("method")
+                    geocode_confidence = geocode.get("confidence")
+                structural_used = merge_structural(profile.structural_json, structural_override)
+                structural_source = "profile"
+                if structural_override and normalize_structural(structural_override):
+                    structural_source = "mixed"
+        else:
+            if lat is None or lon is None:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="lat/lon or address_line1, city, country required",
                 )
-            lat, lon, geocode_confidence, geocode_method = geocode_address(
-                payload.address_line1,
-                payload.city,
-                payload.country,
-                postal_code=payload.postal_code or "",
-                state_region=payload.state_region or "",
-            )
-        else:
             geocode_method = "PROVIDED"
             geocode_confidence = 1.0
-        structural_used = normalize_structural(structural_override)
+            structural_used = normalize_structural(structural_override)
+
+    if lat is not None and lon is not None and geocode_method is None:
+        geocode_method = "PROVIDED"
+        geocode_confidence = 1.0
+    if lat is None or lon is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unable to resolve coordinates for scoring")
 
     version_ids: List[int] = []
     if payload.hazard_dataset_version_ids is not None:
@@ -959,10 +1174,15 @@ def score_resilience(
         "hazard_versions_used": hazard_versions_used,
         "scoring_version": SCORING_VERSION,
         "code_version": settings.code_version,
+        "property_profile_id": property_profile_id,
+        "property_profile_updated_at": property_profile_updated_at,
         "data_quality": {
             "peril_present": peril_present,
             "peril_missing": peril_missing,
             "used_unknown_hazard_fallback": used_unknown_hazard_fallback,
+            "property_enriched": property_enriched,
+            "structural_source": structural_source,
+            "enrichment_profile_id": property_profile_id,
         },
         "result": result,
     }

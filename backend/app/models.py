@@ -39,6 +39,7 @@ class RunType(str, enum.Enum):
     BREACH_EVAL = "BREACH_EVAL"
     DRIFT = "DRIFT"
     RESILIENCE_SCORE = "RESILIENCE_SCORE"
+    PROPERTY_ENRICHMENT = "PROPERTY_ENRICHMENT"
 
 
 class RunStatus(str, enum.Enum):
@@ -238,6 +239,29 @@ class Location(Base):
     __table_args__ = (
         UniqueConstraint("tenant_id", "exposure_version_id", "external_location_id", name="uq_location_unique"),
         Index("ix_location_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class PropertyProfile(Base):
+    __tablename__ = "property_profile"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    location_id = Column(Integer, ForeignKey("location.id", ondelete="SET NULL"), nullable=True)
+    address_fingerprint = Column(String, nullable=False)
+    standardized_address_json = Column(JSON, nullable=True)
+    geocode_json = Column(JSON, nullable=True)
+    parcel_json = Column(JSON, nullable=True)
+    characteristics_json = Column(JSON, nullable=True)
+    structural_json = Column(JSON, nullable=True)
+    provenance_json = Column(JSON, nullable=True)
+    code_version = Column(String, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "address_fingerprint", name="uq_property_profile_fingerprint"),
+        Index("ix_property_profile_tenant_updated", "tenant_id", "updated_at"),
     )
 
 

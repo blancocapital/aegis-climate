@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     minio_bucket: str = "aegis-data"
 
     code_version: str = "dev"
+    geocoder_provider: str = "stub"
+    parcel_provider: str = "stub"
+    characteristics_provider: str = "stub"
+    geocoder_url: str = ""
+    parcel_url: str = ""
+    characteristics_url: str = ""
 
     model_config = SettingsConfigDict(env_prefix="AEGIS_", env_file=".env")
 

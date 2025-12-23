@@ -24,6 +24,8 @@ from app.models import (
     LocationHazardAttribute,
     ResilienceScoreItem,
     ResilienceScoreResult,
+    PropertyProfile,
+    AuditEvent,
     MappingTemplate,
     RollupConfig,
     RollupResult,
@@ -42,7 +44,14 @@ from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.quality import quality_scores
 from app.services.quality_metrics import init_peril_coverage, update_peril_coverage
 from app.services.resilience import DEFAULT_WEIGHTS, compute_resilience_score
-from app.services.structural import normalize_structural
+from app.services.property_enrichment import (
+    STRUCTURAL_KEYS,
+    address_fingerprint,
+    is_profile_fresh,
+    normalize_address,
+    run_enrichment_pipeline,
+)
+from app.services.structural import merge_structural, normalize_structural
 from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.services.drift import COMPARE_FIELDS, compare_exposures
@@ -673,6 +682,129 @@ def compute_resilience_scores(
             "missing_tiv_count": missing_tiv_count,
         }
         run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def enrich_property_profile(
+    run_id: int,
+    tenant_id: str,
+    address_json: Dict,
+    location_id: Optional[int] = None,
+    force_refresh: bool = False,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    if not run or run.tenant_id != tenant_id:
+        return
+    try:
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+
+        normalized = normalize_address(address_json)
+        fingerprint = address_fingerprint(normalized)
+        profile_by_fingerprint = session.execute(
+            select(PropertyProfile).where(
+                PropertyProfile.tenant_id == tenant_id,
+                PropertyProfile.address_fingerprint == fingerprint,
+            )
+        ).scalar_one_or_none()
+        profile_by_location = None
+        if location_id is not None:
+            profile_by_location = session.execute(
+                select(PropertyProfile).where(
+                    PropertyProfile.tenant_id == tenant_id,
+                    PropertyProfile.location_id == location_id,
+                )
+            ).scalar_one_or_none()
+        if profile_by_fingerprint and is_profile_fresh(profile_by_fingerprint.updated_at) and not force_refresh:
+            run.status = RunStatus.SUCCEEDED
+            run.completed_at = datetime.utcnow()
+            run.output_refs_json = {
+                "property_profile_id": profile_by_fingerprint.id,
+                "address_fingerprint": fingerprint,
+                "providers": (profile_by_fingerprint.provenance_json or {}).get("providers"),
+                "field_coverage": {
+                    key: key in (profile_by_fingerprint.structural_json or {}) for key in STRUCTURAL_KEYS
+                },
+            }
+            run.code_version = settings.code_version
+            session.commit()
+            return
+
+        if profile_by_location and profile_by_fingerprint and profile_by_location.id != profile_by_fingerprint.id:
+            profile_by_location.location_id = None
+
+        profile = profile_by_fingerprint or profile_by_location
+        if not profile:
+            profile = PropertyProfile(tenant_id=tenant_id, address_fingerprint=fingerprint)
+
+        payload = run_enrichment_pipeline(address_json)
+        profile.address_fingerprint = payload["address_fingerprint"]
+        profile.standardized_address_json = payload["standardized_address_json"]
+        profile.geocode_json = payload["geocode_json"]
+        profile.parcel_json = payload["parcel_json"]
+        profile.characteristics_json = payload["characteristics_json"]
+        profile.structural_json = payload["structural_json"]
+        profile.provenance_json = payload["provenance_json"]
+        profile.code_version = payload["code_version"]
+        if location_id is not None:
+            profile.location_id = location_id
+        session.add(profile)
+        session.commit()
+
+        if location_id is not None:
+            location = session.get(Location, location_id)
+            if location and location.tenant_id == tenant_id:
+                standardized = profile.standardized_address_json or {}
+                if location.address_line1 is None and standardized.get("address_line1"):
+                    location.address_line1 = standardized.get("address_line1")
+                if location.city is None and standardized.get("city"):
+                    location.city = standardized.get("city")
+                if location.state_region is None and standardized.get("state_region"):
+                    location.state_region = standardized.get("state_region")
+                if location.postal_code is None and standardized.get("postal_code"):
+                    location.postal_code = standardized.get("postal_code")
+                if location.country is None and standardized.get("country"):
+                    location.country = standardized.get("country")
+                geocode = profile.geocode_json or {}
+                if location.latitude is None and geocode.get("lat") is not None:
+                    location.latitude = geocode.get("lat")
+                if location.longitude is None and geocode.get("lon") is not None:
+                    location.longitude = geocode.get("lon")
+                profile_struct = normalize_structural(profile.structural_json)
+                if profile_struct:
+                    existing_struct = normalize_structural(location.structural_json)
+                    location.structural_json = merge_structural(profile_struct, existing_struct)
+                location.updated_at = datetime.utcnow()
+                session.commit()
+
+        field_coverage = {key: key in (profile.structural_json or {}) for key in STRUCTURAL_KEYS}
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = {
+            "property_profile_id": profile.id,
+            "address_fingerprint": fingerprint,
+            "providers": (profile.provenance_json or {}).get("providers"),
+            "field_coverage": field_coverage,
+        }
+        run.code_version = settings.code_version
+        session.add(
+            AuditEvent(
+                tenant_id=tenant_id,
+                user_id=None,
+                action="property_enriched",
+                metadata_json={"property_profile_id": profile.id, "location_id": location_id},
+            )
+        )
         session.commit()
     except Exception:
         run.status = RunStatus.FAILED
