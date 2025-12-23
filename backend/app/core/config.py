@@ -1,4 +1,6 @@
 from functools import lru_cache
+from typing import Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -21,6 +23,26 @@ class Settings(BaseSettings):
     geocoder_provider: str = "stub"
     parcel_provider: str = "stub"
     characteristics_provider: str = "stub"
+
+    geocoder_http_base_url: Optional[str] = None
+    geocoder_http_api_key: Optional[str] = None
+    geocoder_http_api_key_header: str = "Authorization"
+    geocoder_http_mapping_json: Optional[dict] = None
+
+    parcel_http_base_url: Optional[str] = None
+    parcel_http_api_key: Optional[str] = None
+    parcel_http_api_key_header: str = "Authorization"
+    parcel_http_mapping_json: Optional[dict] = None
+
+    characteristics_http_base_url: Optional[str] = None
+    characteristics_http_api_key: Optional[str] = None
+    characteristics_http_api_key_header: str = "Authorization"
+    characteristics_http_mapping_json: Optional[dict] = None
+
+    provider_timeout_seconds: float = 7.0
+    provider_connect_timeout_seconds: float = 3.0
+    provider_max_retries: int = 2
+
     geocoder_url: str = ""
     parcel_url: str = ""
     characteristics_url: str = ""

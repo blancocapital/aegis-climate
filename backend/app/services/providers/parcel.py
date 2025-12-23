@@ -1,13 +1,16 @@
 import hashlib
+from datetime import datetime
 from typing import Any, Dict
 
 from app.core.config import get_settings
+from app.services.providers.base import ParcelResult
+from app.services.providers.http_parcel import HttpParcelProvider
 
 
 class StubParcelProvider:
     name = "stub"
 
-    def parcel_lookup(self, lat: float, lon: float) -> Dict[str, Any]:
+    def parcel_lookup(self, lat: float, lon: float) -> ParcelResult:
         token = f"{lat:.6f}:{lon:.6f}".encode()
         digest = hashlib.sha256(token).hexdigest()[:12]
         parcel_id = f"PARCEL-{digest}"
@@ -27,19 +30,9 @@ class StubParcelProvider:
             "boundary_geojson": boundary,
             "confidence": 0.7,
             "provider": self.name,
+            "retrieved_at": datetime.utcnow().isoformat(),
             "raw": {"lat": lat, "lon": lon},
         }
-
-
-class HttpParcelProvider:
-    name = "http"
-
-    def __init__(self, base_url: str, timeout: float = 3.0):
-        self.base_url = base_url
-        self.timeout = timeout
-
-    def parcel_lookup(self, lat: float, lon: float) -> Dict[str, Any]:
-        raise NotImplementedError("HTTP parcel provider not configured")
 
 
 def get_parcel_provider():
@@ -47,4 +40,12 @@ def get_parcel_provider():
     provider = (settings.parcel_provider or "stub").lower()
     if provider == "stub":
         return StubParcelProvider()
-    return HttpParcelProvider(getattr(settings, "parcel_url", ""), timeout=3.0)
+    return HttpParcelProvider(
+        base_url=settings.parcel_http_base_url,
+        api_key=settings.parcel_http_api_key,
+        api_key_header=settings.parcel_http_api_key_header,
+        mapping=settings.parcel_http_mapping_json,
+        timeout_seconds=settings.provider_timeout_seconds,
+        connect_timeout_seconds=settings.provider_connect_timeout_seconds,
+        max_retries=settings.provider_max_retries,
+    )

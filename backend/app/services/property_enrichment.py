@@ -1,10 +1,11 @@
 import hashlib
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.core.config import get_settings
 from app.services.providers import get_characteristics_provider, get_geocoder, get_parcel_provider
+from app.services.providers.base import ProviderError
 from app.services.structural import normalize_structural
 
 
@@ -43,7 +44,7 @@ def map_to_structural(
     parcel_json: Optional[Dict[str, Any]],
     geocode_json: Optional[Dict[str, Any]],
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    retrieved_at = datetime.utcnow().isoformat()
+    retrieved_at_default = datetime.utcnow().isoformat()
     characteristics_json = characteristics_json or {}
     parcel_json = parcel_json or {}
     geocode_json = geocode_json or {}
@@ -58,7 +59,7 @@ def map_to_structural(
             "source": "characteristics",
             "provider": characteristics_json.get("provider"),
             "confidence": (characteristics_json.get("field_confidence") or {}).get("roof_material", 0.0),
-            "retrieved_at": retrieved_at,
+            "retrieved_at": characteristics_json.get("retrieved_at") or retrieved_at_default,
             "method": "stub",
         }
     else:
@@ -66,7 +67,7 @@ def map_to_structural(
             "source": None,
             "provider": characteristics_json.get("provider"),
             "confidence": 0.0,
-            "retrieved_at": retrieved_at,
+            "retrieved_at": characteristics_json.get("retrieved_at") or retrieved_at_default,
             "method": "missing",
         }
 
@@ -77,7 +78,7 @@ def map_to_structural(
             "source": "geocode" if geocode_json.get("elevation_m") is not None else "parcel",
             "provider": geocode_json.get("provider") or parcel_json.get("provider"),
             "confidence": geocode_json.get("confidence") or parcel_json.get("confidence") or 0.0,
-            "retrieved_at": retrieved_at,
+            "retrieved_at": geocode_json.get("retrieved_at") or parcel_json.get("retrieved_at") or retrieved_at_default,
             "method": "stub",
         }
     else:
@@ -85,7 +86,7 @@ def map_to_structural(
             "source": None,
             "provider": None,
             "confidence": 0.0,
-            "retrieved_at": retrieved_at,
+            "retrieved_at": retrieved_at_default,
             "method": "missing",
         }
 
@@ -96,7 +97,7 @@ def map_to_structural(
             "source": "characteristics" if characteristics_json.get("vegetation_proximity_m") is not None else "parcel",
             "provider": characteristics_json.get("provider") or parcel_json.get("provider"),
             "confidence": (characteristics_json.get("field_confidence") or {}).get("vegetation_proximity_m", 0.0),
-            "retrieved_at": retrieved_at,
+            "retrieved_at": characteristics_json.get("retrieved_at") or parcel_json.get("retrieved_at") or retrieved_at_default,
             "method": "stub",
         }
     else:
@@ -104,7 +105,7 @@ def map_to_structural(
             "source": None,
             "provider": None,
             "confidence": 0.0,
-            "retrieved_at": retrieved_at,
+            "retrieved_at": retrieved_at_default,
             "method": "missing",
         }
 
@@ -116,6 +117,7 @@ def build_property_profile_payload(
     geocode: Dict[str, Any],
     parcel: Dict[str, Any],
     characteristics: Dict[str, Any],
+    errors: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     settings = get_settings()
     structural_json, field_provenance = map_to_structural(characteristics, parcel, geocode)
@@ -129,8 +131,10 @@ def build_property_profile_payload(
         },
         "field_provenance": field_provenance,
     }
+    if errors:
+        provenance["errors"] = errors
     return {
-        "standardized_address_json": normalized_address,
+        "standardized_address_json": geocode.get("standardized_address") or normalized_address,
         "geocode_json": geocode,
         "parcel_json": parcel,
         "characteristics_json": characteristics,
@@ -159,13 +163,68 @@ def providers_are_stub() -> bool:
 
 def run_enrichment_pipeline(address_json: Dict[str, Any]) -> Dict[str, Any]:
     normalized = normalize_address(address_json)
-    geocode = get_geocoder().forward_geocode(normalized)
-    parcel = get_parcel_provider().parcel_lookup(geocode["lat"], geocode["lon"])
     fingerprint = address_fingerprint(normalized)
-    characteristics = get_characteristics_provider().get_characteristics(fingerprint)
-    payload = build_property_profile_payload(normalized, geocode, parcel, characteristics)
+    errors: List[Dict[str, Any]] = []
+
+    geocoder = get_geocoder()
+    geocode: Dict[str, Any] = {}
+    try:
+        geocode = geocoder.forward_geocode(normalized)
+    except ProviderError as exc:
+        errors.append(exc.to_dict())
+        geocode = {"provider": getattr(geocoder, "name", "unknown"), "confidence": 0.0, "retrieved_at": datetime.utcnow().isoformat(), "raw": {}}
+
+    parcel_provider = get_parcel_provider()
+    parcel: Dict[str, Any] = {}
+    if geocode.get("lat") is not None and geocode.get("lon") is not None:
+        try:
+            parcel = parcel_provider.parcel_lookup(float(geocode.get("lat")), float(geocode.get("lon")))
+        except ProviderError as exc:
+            errors.append(exc.to_dict())
+            parcel = {"provider": getattr(parcel_provider, "name", "unknown"), "confidence": 0.0, "retrieved_at": datetime.utcnow().isoformat(), "raw": {}}
+    else:
+        errors.append(ProviderError(code="bad_request", message="Missing lat/lon for parcel lookup", retryable=False).to_dict())
+
+    characteristics_provider = get_characteristics_provider()
+    characteristics: Dict[str, Any] = {}
+    try:
+        characteristics = characteristics_provider.get_characteristics(fingerprint)
+    except ProviderError as exc:
+        errors.append(exc.to_dict())
+        characteristics = {
+            "provider": getattr(characteristics_provider, "name", "unknown"),
+            "confidence": 0.0,
+            "retrieved_at": datetime.utcnow().isoformat(),
+            "raw": {},
+            "field_confidence": {},
+        }
+
+    payload = build_property_profile_payload(normalized, geocode, parcel, characteristics, errors=errors)
     payload["address_fingerprint"] = fingerprint
     return payload
+
+
+def decide_enrichment_action(
+    async_required: bool,
+    wait_seconds: int,
+    best_effort: bool,
+    run_status: Optional[str],
+) -> Dict[str, Any]:
+    if not async_required:
+        return {"action": "score", "enrichment_status": "used_profile", "enrichment_failed": False}
+    if run_status == "SUCCEEDED":
+        return {"action": "score", "enrichment_status": "used_profile", "enrichment_failed": False}
+    if run_status == "FAILED":
+        if best_effort:
+            return {"action": "score", "enrichment_status": "failed", "enrichment_failed": True}
+        return {"action": "error", "enrichment_status": "failed", "enrichment_failed": True}
+    if wait_seconds <= 0:
+        if best_effort:
+            return {"action": "score", "enrichment_status": "queued", "enrichment_failed": False}
+        return {"action": "return_202", "enrichment_status": "queued", "enrichment_failed": False}
+    if best_effort:
+        return {"action": "score", "enrichment_status": "queued", "enrichment_failed": False}
+    return {"action": "return_202", "enrichment_status": "queued", "enrichment_failed": False}
 
 
 def is_profile_fresh(updated_at: Optional[datetime], days: int = 30) -> bool:

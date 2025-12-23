@@ -81,7 +81,7 @@ def iter_resilience_export_rows(
     result_id: int,
     batch_size: int = 2000,
 ) -> Iterator[str]:
-    offset = 0
+    start_after_id = 0
     first = True
     while True:
         rows = db.execute(
@@ -90,10 +90,10 @@ def iter_resilience_export_rows(
             .where(
                 ResilienceScoreItem.tenant_id == tenant_id,
                 ResilienceScoreItem.resilience_score_result_id == result_id,
+                ResilienceScoreItem.id > start_after_id,
             )
             .order_by(ResilienceScoreItem.id.asc())
             .limit(batch_size)
-            .offset(offset)
         ).all()
         if not rows:
             break
@@ -125,6 +125,6 @@ def iter_resilience_export_rows(
                     "input_structural_json": input_structural,
                 }
             )
+            start_after_id = item.id
         yield rows_to_csv(export_rows, include_header=first)
         first = False
-        offset += batch_size

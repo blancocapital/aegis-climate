@@ -1,7 +1,10 @@
 import hashlib
+from datetime import datetime
 from typing import Any, Dict
 
 from app.core.config import get_settings
+from app.services.providers.base import CharacteristicsResult
+from app.services.providers.http_characteristics import HttpCharacteristicsProvider
 
 ROOF_MATERIALS = ["metal", "tile", "asphalt_shingle", "wood_shake"]
 
@@ -9,7 +12,7 @@ ROOF_MATERIALS = ["metal", "tile", "asphalt_shingle", "wood_shake"]
 class StubCharacteristicsProvider:
     name = "stub"
 
-    def get_characteristics(self, address_fingerprint: str) -> Dict[str, Any]:
+    def get_characteristics(self, address_fingerprint: str) -> CharacteristicsResult:
         digest = hashlib.sha256(address_fingerprint.encode()).hexdigest()
         roof_material = ROOF_MATERIALS[int(digest[:2], 16) % len(ROOF_MATERIALS)]
         year_built = 1950 + (int(digest[2:6], 16) % 71)
@@ -31,19 +34,10 @@ class StubCharacteristicsProvider:
             "sqft": sqft,
             "vegetation_proximity_m": float(vegetation_proximity_m),
             "field_confidence": field_confidence,
+            "confidence": 0.6,
+            "retrieved_at": datetime.utcnow().isoformat(),
             "raw": {"fingerprint": address_fingerprint},
         }
-
-
-class HttpCharacteristicsProvider:
-    name = "http"
-
-    def __init__(self, base_url: str, timeout: float = 3.0):
-        self.base_url = base_url
-        self.timeout = timeout
-
-    def get_characteristics(self, address_fingerprint: str) -> Dict[str, Any]:
-        raise NotImplementedError("HTTP characteristics provider not configured")
 
 
 def get_characteristics_provider():
@@ -51,4 +45,12 @@ def get_characteristics_provider():
     provider = (settings.characteristics_provider or "stub").lower()
     if provider == "stub":
         return StubCharacteristicsProvider()
-    return HttpCharacteristicsProvider(getattr(settings, "characteristics_url", ""), timeout=3.0)
+    return HttpCharacteristicsProvider(
+        base_url=settings.characteristics_http_base_url,
+        api_key=settings.characteristics_http_api_key,
+        api_key_header=settings.characteristics_http_api_key_header,
+        mapping=settings.characteristics_http_mapping_json,
+        timeout_seconds=settings.provider_timeout_seconds,
+        connect_timeout_seconds=settings.provider_connect_timeout_seconds,
+        max_retries=settings.provider_max_retries,
+    )

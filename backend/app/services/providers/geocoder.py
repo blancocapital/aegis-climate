@@ -1,13 +1,16 @@
+from datetime import datetime
 from typing import Any, Dict
 
 from app.core.config import get_settings
 from app.services.geocode import geocode_address
+from app.services.providers.base import GeocodeResult
+from app.services.providers.http_geocoder import HttpGeocoder
 
 
 class StubGeocoder:
     name = "stub"
 
-    def forward_geocode(self, address: Dict[str, Any]) -> Dict[str, Any]:
+    def forward_geocode(self, address: Dict[str, Any]) -> GeocodeResult:
         lat, lon, confidence, method = geocode_address(
             address.get("address_line1", ""),
             address.get("city", ""),
@@ -22,19 +25,9 @@ class StubGeocoder:
             "confidence": confidence,
             "provider": self.name,
             "method": method,
+            "retrieved_at": datetime.utcnow().isoformat(),
             "raw": {"input": address},
         }
-
-
-class HttpGeocoder:
-    name = "http"
-
-    def __init__(self, base_url: str, timeout: float = 3.0):
-        self.base_url = base_url
-        self.timeout = timeout
-
-    def forward_geocode(self, address: Dict[str, Any]) -> Dict[str, Any]:
-        raise NotImplementedError("HTTP geocoder not configured")
 
 
 def get_geocoder():
@@ -42,4 +35,12 @@ def get_geocoder():
     provider = (settings.geocoder_provider or "stub").lower()
     if provider == "stub":
         return StubGeocoder()
-    return HttpGeocoder(getattr(settings, "geocoder_url", ""), timeout=3.0)
+    return HttpGeocoder(
+        base_url=settings.geocoder_http_base_url,
+        api_key=settings.geocoder_http_api_key,
+        api_key_header=settings.geocoder_http_api_key_header,
+        mapping=settings.geocoder_http_mapping_json,
+        timeout_seconds=settings.provider_timeout_seconds,
+        connect_timeout_seconds=settings.provider_connect_timeout_seconds,
+        max_retries=settings.provider_max_retries,
+    )
