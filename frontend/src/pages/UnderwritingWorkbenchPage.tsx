@@ -16,7 +16,7 @@ import { Skeleton } from '../components/ui/skeleton'
 import { Table, TBody, TD, TH, THead, TR } from '../components/ui/table'
 import { prettyJson } from '../utils/json'
 
-const DEFAULT_COUNTRY = 'US'
+const DEFAULT_COUNTRY = 'CA'
 const AUTO_RETRY_LIMIT = 3
 const AUTO_RETRY_DELAY_MS = 2000
 
@@ -63,6 +63,15 @@ function formatValue(value: unknown): string {
   return JSON.stringify(value)
 }
 
+function normalizeCountryCode(value?: string) {
+  const raw = (value || DEFAULT_COUNTRY).trim().toLowerCase()
+  if (!raw) return DEFAULT_COUNTRY.toLowerCase()
+  if (['ca', 'can', 'canada'].includes(raw)) return 'ca'
+  if (['us', 'usa', 'united states', 'united states of america'].includes(raw)) return 'us'
+  if (raw.length === 2) return raw
+  return DEFAULT_COUNTRY.toLowerCase()
+}
+
 function getErrorInfo(error: unknown): { message: string; requestId?: string; code?: string } {
   const record = asRecord(error) || {}
   const message = asString(record.message) || 'Request failed'
@@ -101,6 +110,9 @@ export function UnderwritingWorkbenchPage() {
     enrich_mode: 'auto',
     include_decision: true,
   })
+
+  const countryCode = normalizeCountryCode(form.country)
+  const isCanada = countryCode === 'ca'
 
   const success = isSuccess(response) ? response : null
   const queued = isQueued(response) ? response : null
@@ -171,7 +183,7 @@ export function UnderwritingWorkbenchPage() {
   function handleSubmit(event?: FormEvent) {
     if (event) event.preventDefault()
     if (!form.address_line1 || !form.city || !form.state_region) {
-      toast.error('Address line, city, and state are required')
+      toast.error(`Address line, city, and ${isCanada ? 'province' : 'state'} are required`)
       return
     }
     const payload = {
@@ -179,7 +191,7 @@ export function UnderwritingWorkbenchPage() {
       city: form.city,
       state_region: form.state_region,
       postal_code: form.postal_code,
-      country: form.country || DEFAULT_COUNTRY,
+      country: countryCode.toUpperCase(),
       best_effort: form.best_effort,
       wait_for_enrichment_seconds: Number(form.wait_for_enrichment_seconds || 0),
       enrich_mode: form.enrich_mode,
@@ -238,7 +250,6 @@ export function UnderwritingWorkbenchPage() {
       return
     }
     const query = [trimmed, form.city, form.state_region].filter(Boolean).join(' ')
-    const countryCode = (form.country || DEFAULT_COUNTRY).toLowerCase()
     setIsSuggesting(true)
     const timer = window.setTimeout(async () => {
       try {
@@ -266,7 +277,9 @@ export function UnderwritingWorkbenchPage() {
     const state = suggestion.state_region || form.state_region
     const city = suggestion.city || form.city
     const postal = suggestion.postal_code || form.postal_code
-    const country = (suggestion.country_code || suggestion.country || form.country || DEFAULT_COUNTRY).toUpperCase()
+    const country = normalizeCountryCode(
+      suggestion.country_code || suggestion.country || form.country || DEFAULT_COUNTRY
+    ).toUpperCase()
     setForm((prev) => ({
       ...prev,
       address_line1: addressLine,
@@ -380,9 +393,11 @@ export function UnderwritingWorkbenchPage() {
                 />
               </div>
               <div className="space-y-2">
-                <label className="text-xs font-semibold uppercase text-slate-500">State</label>
+                <label className="text-xs font-semibold uppercase text-slate-500">
+                  {isCanada ? 'Province' : 'State'}
+                </label>
                 <Input
-                  placeholder="CA"
+                  placeholder={isCanada ? 'ON' : 'CA'}
                   value={form.state_region}
                   onChange={(e) => setForm((prev) => ({ ...prev, state_region: e.target.value }))}
                 />
@@ -392,18 +407,20 @@ export function UnderwritingWorkbenchPage() {
               <div className="space-y-2">
                 <label className="text-xs font-semibold uppercase text-slate-500">Postal code</label>
                 <Input
-                  placeholder="94105"
+                  placeholder={isCanada ? 'A1A 1A1' : '94105'}
                   value={form.postal_code}
                   onChange={(e) => setForm((prev) => ({ ...prev, postal_code: e.target.value }))}
                 />
               </div>
               <div className="space-y-2">
                 <label className="text-xs font-semibold uppercase text-slate-500">Country</label>
-                <Input
-                  placeholder="US"
+                <Select
                   value={form.country}
                   onChange={(e) => setForm((prev) => ({ ...prev, country: e.target.value }))}
-                />
+                >
+                  <option value="CA">Canada (CA)</option>
+                  <option value="US">United States (US)</option>
+                </Select>
               </div>
             </div>
 
