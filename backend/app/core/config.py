@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     provider_connect_timeout_seconds: float = 3.0
     provider_max_retries: int = 2
 
+    geoapify_api_key: Optional[str] = None
+    geoapify_autocomplete_url: str = "https://api.geoapify.com/v1/geocode/autocomplete"
+
     geocoder_url: str = ""
     parcel_url: str = ""
     characteristics_url: str = ""

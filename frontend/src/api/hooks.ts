@@ -20,6 +20,11 @@ import {
   UploadResponseSchema,
   ValidationResultSchema,
   UnderwritingPacketResponseSchema,
+  UWRuleSchema,
+  UWFindingSchema,
+  UWNoteSchema,
+  UWDecisionSchema,
+  UWSummarySchema,
 } from './types'
 
 const pollingStatuses = ['QUEUED', 'RUNNING']
@@ -307,6 +312,100 @@ export function useUpdateBreachStatus() {
   return useMutation({
     mutationFn: (payload: { id: number; status: string }) =>
       apiRequest({ method: 'PATCH', path: `/breaches/${payload.id}`, body: { status: payload.status } }),
+  })
+}
+
+export function useUpdateExceptionStatus() {
+  return useMutation({
+    mutationFn: (payload: { exception_key: string; status: string }) =>
+      apiRequest({ method: 'PATCH', path: `/exceptions/${encodeURIComponent(payload.exception_key)}`, body: { status: payload.status } }),
+  })
+}
+
+export function useUWSummary(exposureVersionId?: number | string) {
+  return useQuery({
+    queryKey: ['uw-summary', exposureVersionId],
+    queryFn: () =>
+      apiRequest({ path: `/exposure-versions/${exposureVersionId}/uw-summary` }).then((res) =>
+        UWSummarySchema.parse(res)
+      ),
+    enabled: Boolean(exposureVersionId),
+  })
+}
+
+export function useUWRules() {
+  return useQuery({
+    queryKey: ['uw-rules'],
+    queryFn: () =>
+      apiRequest({ path: '/uw-rules' }).then((res) =>
+        UWRuleSchema.array().parse(normalizeListResponse(res))
+      ),
+  })
+}
+
+export function useCreateUWRule() {
+  return useMutation({
+    mutationFn: (payload: { name: string; category: string; severity: string; target: string; active?: boolean; rule_json: unknown }) =>
+      apiRequest({ method: 'POST', path: '/uw-rules', body: payload }).then((res) => UWRuleSchema.parse(res)),
+  })
+}
+
+export function useRunUWEval() {
+  return useMutation({
+    mutationFn: (payload: { exposure_version_id: number; rollup_result_id?: number; uw_rule_ids?: number[] }) =>
+      apiRequest({ method: 'POST', path: '/uw-findings/run', body: payload }),
+  })
+}
+
+export function useUWFindingList(params?: QueryParams) {
+  return useQuery({
+    queryKey: ['uw-findings', params],
+    queryFn: () =>
+      apiRequest({ path: '/uw-findings', params }).then((res) =>
+        UWFindingSchema.array().parse(normalizeListResponse(res))
+      ),
+  })
+}
+
+export function useUpdateUWFinding() {
+  return useMutation({
+    mutationFn: (payload: { id: number; status?: string; disposition?: string }) =>
+      apiRequest({ method: 'PATCH', path: `/uw-findings/${payload.id}`, body: { status: payload.status, disposition: payload.disposition } }),
+  })
+}
+
+export function useUWNotes(entity_type?: string, entity_id?: string) {
+  return useQuery({
+    queryKey: ['uw-notes', entity_type, entity_id],
+    queryFn: () =>
+      apiRequest({ path: '/notes', params: { entity_type, entity_id } }).then((res) =>
+        UWNoteSchema.array().parse(normalizeListResponse(res))
+      ),
+    enabled: Boolean(entity_type && entity_id),
+  })
+}
+
+export function useCreateUWNote() {
+  return useMutation({
+    mutationFn: (payload: { entity_type: string; entity_id: string; note_text: string }) =>
+      apiRequest({ method: 'POST', path: '/notes', body: payload }).then((res) => UWNoteSchema.parse(res)),
+  })
+}
+
+export function useUWDecisions(params?: QueryParams) {
+  return useQuery({
+    queryKey: ['uw-decisions', params],
+    queryFn: () =>
+      apiRequest({ path: '/decisions', params }).then((res) =>
+        UWDecisionSchema.array().parse(normalizeListResponse(res))
+      ),
+  })
+}
+
+export function useCreateUWDecision() {
+  return useMutation({
+    mutationFn: (payload: { exposure_version_id: number; decision: string; conditions_json?: string[]; rationale_text: string }) =>
+      apiRequest({ method: 'POST', path: '/decisions', body: payload }).then((res) => UWDecisionSchema.parse(res)),
   })
 }
 

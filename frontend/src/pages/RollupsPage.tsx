@@ -96,7 +96,10 @@ export function RollupsPage() {
   return (
     <div className="space-y-4">
       <Card className="space-y-3">
-        <h2 className="text-lg font-semibold">Rollup configs</h2>
+        <div>
+          <h2 className="text-lg font-semibold">Rollup configs</h2>
+          <p className="text-sm text-slate-600">Define concentration views for underwriting review.</p>
+        </div>
         <div className="grid gap-2 md:grid-cols-2">
           <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Config name" />
           <Textarea rows={4} value={configJson} onChange={(e) => setConfigJson(e.target.value)} />
@@ -107,7 +110,10 @@ export function RollupsPage() {
         <DataTable data={configs} columns={configColumns} />
       </Card>
       <Card className="space-y-3">
-        <h3 className="text-lg font-semibold">Run rollup</h3>
+        <div>
+          <h3 className="text-lg font-semibold">Top concentrations</h3>
+          <p className="text-sm text-slate-600">Run rollups to surface highest TIV groupings.</p>
+        </div>
         <div className="grid gap-3 md:grid-cols-3">
           <Select value={selectedExposure?.toString() || ''} onChange={(e) => setSelectedExposure(Number(e.target.value))}>
             <option value="">Exposure</option>

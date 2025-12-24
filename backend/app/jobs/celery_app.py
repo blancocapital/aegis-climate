@@ -34,6 +34,8 @@ from app.models import (
     RunType,
     Tenant,
     ThresholdRule,
+    UWRule,
+    UWFinding,
     ValidationResult,
 )
 from app.services.validation import read_csv_bytes, validate_rows
@@ -55,6 +57,12 @@ from app.services.rollup import compute_rollup
 from app.services.breaches import evaluate_rule_on_rollup_rows
 from app.services.drift import COMPARE_FIELDS, compare_exposures
 from app.services.run_progress import merge_run_progress
+from app.services.uw_rules import (
+    build_location_record,
+    build_rollup_record,
+    canonical_json,
+    evaluate_rule,
+)
 from app.storage.s3 import compute_checksum, get_object, put_object
 
 settings = get_settings()
@@ -83,6 +91,45 @@ def _update_progress(
 
 def _log_task_start(task_name: str, run_id: int, request_id: Optional[str]) -> None:
     logger.info("%s started run_id=%s request_id=%s", task_name, run_id, request_id)
+
+
+def _uw_rule_disposition(rule_json: Dict[str, Any]) -> str:
+    return ((rule_json or {}).get("then") or {}).get("disposition") or "NONE"
+
+
+def _uw_rule_conditions(rule_json: Dict[str, Any]) -> List[str]:
+    return ((rule_json or {}).get("then") or {}).get("suggested_conditions") or []
+
+
+def _build_uw_explanation(rule: UWRule, record: Dict[str, Any], eval_explanation: Dict[str, Any]) -> Dict[str, Any]:
+    context_fields = [
+        "tiv",
+        "country",
+        "state_region",
+        "postal_code",
+        "lob",
+        "product_code",
+        "currency",
+        "quality_tier",
+        "geocode_confidence",
+        "hazard_band",
+        "hazard_category",
+    ]
+    context = {field: record.get(field) for field in context_fields if field in record}
+    if "rollup" in record:
+        context["rollup"] = record.get("rollup")
+    return {
+        "rule_id": rule.id,
+        "rule_name": rule.name,
+        "category": rule.category,
+        "severity": rule.severity,
+        "target": rule.target,
+        "disposition": _uw_rule_disposition(rule.rule_json),
+        "suggested_conditions": _uw_rule_conditions(rule.rule_json),
+        "evaluation": eval_explanation,
+        "observed": eval_explanation.get("observed") or {},
+        "context": context,
+    }
 
 
 @celery_app.task
@@ -359,6 +406,260 @@ def breach_evaluate(
             },
             processed=len(items),
             total=len(items),
+        )
+        run.code_version = settings.code_version
+        session.commit()
+    except Exception:
+        run.status = RunStatus.FAILED
+        run.completed_at = datetime.utcnow()
+        session.commit()
+        raise
+    finally:
+        session.close()
+
+
+@celery_app.task
+def uw_evaluate(
+    run_id: int,
+    exposure_version_id: int,
+    rollup_result_id: Optional[int],
+    uw_rule_ids: Optional[List[int]],
+    tenant_id: str,
+    request_id: Optional[str] = None,
+):
+    session = SessionLocal()
+    run = session.get(Run, run_id)
+    if not run or run.tenant_id != tenant_id:
+        return
+    try:
+        if run.status == RunStatus.CANCELLED:
+            return
+        _attach_request_id(run, request_id)
+        run.status = RunStatus.RUNNING
+        run.started_at = datetime.utcnow()
+        session.commit()
+        _log_task_start("uw_evaluate", run_id, request_id)
+        exposure_version = session.get(ExposureVersion, exposure_version_id)
+        if not exposure_version or exposure_version.tenant_id != tenant_id:
+            raise ValueError("exposure version not found")
+
+        rule_query = select(UWRule).where(UWRule.tenant_id == tenant_id, UWRule.active.is_(True))
+        if uw_rule_ids:
+            rule_query = rule_query.where(UWRule.id.in_(uw_rule_ids))
+        rules = session.execute(rule_query).scalars().all()
+        location_rules = [r for r in rules if r.target == "LOCATION"]
+        rollup_rules = [r for r in rules if r.target == "ROLLUP"]
+
+        locations = session.query(Location).filter(
+            Location.tenant_id == tenant_id,
+            Location.exposure_version_id == exposure_version_id,
+        ).all()
+
+        hazard_rows = session.execute(
+            select(LocationHazardAttribute.location_id, LocationHazardAttribute.attributes_json)
+            .join(Location, Location.id == LocationHazardAttribute.location_id)
+            .where(
+                Location.tenant_id == tenant_id,
+                Location.exposure_version_id == exposure_version_id,
+            )
+        ).all()
+        hazard_by_location: Dict[int, List[Dict[str, Any]]] = {}
+        for loc_id, attrs in hazard_rows:
+            hazard_by_location.setdefault(loc_id, []).append(attrs or {})
+
+        rollup_items: List[RollupResultItem] = []
+        if rollup_result_id:
+            rollup_result = session.get(RollupResult, rollup_result_id)
+            if rollup_result and rollup_result.tenant_id == tenant_id:
+                rollup_items = session.query(RollupResultItem).filter(
+                    RollupResultItem.tenant_id == tenant_id,
+                    RollupResultItem.rollup_result_id == rollup_result_id,
+                ).all()
+
+        total_items = len(locations) + len(rollup_items)
+        _update_progress(session, run, processed=0, total=total_items)
+
+        now = datetime.utcnow()
+        opened = 0
+        resolved = 0
+        processed_locations = 0
+
+        for rule in location_rules:
+            session.refresh(run)
+            if run.status == RunStatus.CANCELLED:
+                return
+            matches: List[Dict[str, Any]] = []
+            for loc in locations:
+                record = build_location_record(loc, hazard_by_location.get(loc.id, []))
+                matched, eval_explanation = evaluate_rule(rule.rule_json, record)
+                if matched:
+                    matches.append(
+                        {"location": loc, "record": record, "evaluation": eval_explanation}
+                    )
+            matches.sort(key=lambda m: m["location"].id)
+            matched_ids = {m["location"].id for m in matches}
+            disposition = _uw_rule_disposition(rule.rule_json)
+            for match in matches:
+                explanation_json = _build_uw_explanation(rule, match["record"], match["evaluation"])
+                finding = session.execute(
+                    select(UWFinding).where(
+                        UWFinding.tenant_id == tenant_id,
+                        UWFinding.uw_rule_id == rule.id,
+                        UWFinding.exposure_version_id == exposure_version_id,
+                        UWFinding.location_id == match["location"].id,
+                    )
+                ).scalar_one_or_none()
+                if not finding:
+                    finding = UWFinding(
+                        tenant_id=tenant_id,
+                        exposure_version_id=exposure_version_id,
+                        location_id=match["location"].id,
+                        rollup_result_id=rollup_result_id,
+                        uw_rule_id=rule.id,
+                        status="OPEN",
+                        disposition=disposition,
+                        explanation_json=explanation_json,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        resolved_at=None,
+                        last_eval_run_id=run_id,
+                    )
+                    session.add(finding)
+                    opened += 1
+                else:
+                    finding.disposition = disposition
+                    finding.explanation_json = explanation_json
+                    finding.last_seen_at = now
+                    finding.last_eval_run_id = run_id
+                    if finding.status == "RESOLVED":
+                        finding.status = "OPEN"
+                        finding.resolved_at = None
+                        opened += 1
+            session.commit()
+            stale_conditions = [
+                UWFinding.tenant_id == tenant_id,
+                UWFinding.uw_rule_id == rule.id,
+                UWFinding.exposure_version_id == exposure_version_id,
+                UWFinding.location_id.isnot(None),
+            ]
+            if matched_ids:
+                stale_conditions.append(~UWFinding.location_id.in_(matched_ids))
+            stale_findings = session.execute(select(UWFinding).where(*stale_conditions)).scalars().all()
+            for finding in stale_findings:
+                if finding.status in ("OPEN", "ACKED"):
+                    finding.status = "RESOLVED"
+                    finding.resolved_at = now
+                    finding.last_seen_at = now
+                    finding.last_eval_run_id = run_id
+                    resolved += 1
+            session.commit()
+        if locations:
+            processed_locations = len(locations)
+            _update_progress(session, run, processed=processed_locations, total=total_items)
+
+        for rule in rollup_rules:
+            session.refresh(run)
+            if run.status == RunStatus.CANCELLED:
+                return
+            if not rollup_items:
+                continue
+            matches = []
+            for item in rollup_items:
+                record = build_rollup_record(item.rollup_key_json, item.metrics_json)
+                matched, eval_explanation = evaluate_rule(rule.rule_json, record)
+                if matched:
+                    matches.append(
+                        {
+                            "rollup_key_hash": item.rollup_key_hash,
+                            "rollup_key_json": item.rollup_key_json,
+                            "metrics_json": item.metrics_json,
+                            "record": record,
+                            "evaluation": eval_explanation,
+                        }
+                    )
+            matches.sort(key=lambda m: canonical_json(m["rollup_key_json"]))
+            matched_hashes = {m["rollup_key_hash"] for m in matches}
+            disposition = _uw_rule_disposition(rule.rule_json)
+            for match in matches:
+                explanation_json = _build_uw_explanation(rule, match["record"], match["evaluation"])
+                explanation_json["rollup_key_json"] = match["rollup_key_json"]
+                explanation_json["metrics_json"] = match["metrics_json"]
+                finding = session.execute(
+                    select(UWFinding).where(
+                        UWFinding.tenant_id == tenant_id,
+                        UWFinding.uw_rule_id == rule.id,
+                        UWFinding.exposure_version_id == exposure_version_id,
+                        UWFinding.rollup_key_hash == match["rollup_key_hash"],
+                    )
+                ).scalar_one_or_none()
+                if not finding:
+                    finding = UWFinding(
+                        tenant_id=tenant_id,
+                        exposure_version_id=exposure_version_id,
+                        rollup_result_id=rollup_result_id,
+                        rollup_key_hash=match["rollup_key_hash"],
+                        uw_rule_id=rule.id,
+                        status="OPEN",
+                        disposition=disposition,
+                        explanation_json=explanation_json,
+                        first_seen_at=now,
+                        last_seen_at=now,
+                        resolved_at=None,
+                        last_eval_run_id=run_id,
+                    )
+                    session.add(finding)
+                    opened += 1
+                else:
+                    finding.disposition = disposition
+                    finding.explanation_json = explanation_json
+                    finding.last_seen_at = now
+                    finding.rollup_result_id = rollup_result_id
+                    finding.last_eval_run_id = run_id
+                    if finding.status == "RESOLVED":
+                        finding.status = "OPEN"
+                        finding.resolved_at = None
+                        opened += 1
+            session.commit()
+            stale_conditions = [
+                UWFinding.tenant_id == tenant_id,
+                UWFinding.uw_rule_id == rule.id,
+                UWFinding.exposure_version_id == exposure_version_id,
+                UWFinding.rollup_key_hash.isnot(None),
+            ]
+            if matched_hashes:
+                stale_conditions.append(~UWFinding.rollup_key_hash.in_(matched_hashes))
+            stale_findings = session.execute(select(UWFinding).where(*stale_conditions)).scalars().all()
+            for finding in stale_findings:
+                if finding.status in ("OPEN", "ACKED"):
+                    finding.status = "RESOLVED"
+                    finding.resolved_at = now
+                    finding.last_seen_at = now
+                    finding.rollup_result_id = rollup_result_id
+                    finding.last_eval_run_id = run_id
+                    resolved += 1
+            session.commit()
+        if rollup_items:
+            _update_progress(
+                session,
+                run,
+                processed=processed_locations + len(rollup_items),
+                total=total_items,
+            )
+
+        run.status = RunStatus.SUCCEEDED
+        run.completed_at = datetime.utcnow()
+        run.output_refs_json = merge_run_progress(
+            {
+                "exposure_version_id": exposure_version_id,
+                "rollup_result_id": rollup_result_id,
+                "uw_findings_open": opened,
+                "uw_findings_resolved": resolved,
+                "rules_evaluated": len(rules),
+                "location_rules": len(location_rules),
+                "rollup_rules": len(rollup_rules),
+            },
+            processed=total_items,
+            total=total_items,
         )
         run.code_version = settings.code_version
         session.commit()

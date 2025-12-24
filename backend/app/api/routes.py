@@ -11,7 +11,7 @@ from pydantic import BaseModel
 import jwt
 from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile, status, Header
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import case, func, select, or_, and_
+from sqlalchemy import case, func, select, or_, and_, Float
 from sqlalchemy.orm import Session
 
 from app.core.auth import TokenData, create_access_token, require_role, verify_password
@@ -48,6 +48,11 @@ from app.models import (
     RollupResultItem,
     ThresholdRule,
     Breach,
+    UWRule,
+    UWFinding,
+    UWNote,
+    UWDecision,
+    ExceptionTriage,
     ResilienceScoreResult,
     ResilienceScoreItem,
     PropertyProfile,
@@ -55,6 +60,7 @@ from app.models import (
     PolicyPackVersion,
 )
 from app.services.geocode import geocode_address
+from app.services.geoapify import geoapify_autocomplete
 from app.services.hazard_query import extract_hazard_entry, merge_worst_in_peril
 from app.services.lineage import build_lineage
 from app.services.pagination import resolve_keyset_pagination
@@ -64,6 +70,7 @@ from app.services.resilience_export import iter_resilience_export_rows
 from app.services.resilience import DEFAULT_WEIGHTS, SCORING_VERSION, compute_resilience_score
 from app.services.structural import merge_structural, normalize_structural
 from app.services.explainability import build_explainability
+from app.services.exceptions import exception_impact_and_action, exception_key, parse_exception_key
 from app.services.policy_resolver import merge_policy_overrides, resolve_policy_version
 from app.services.property_enrichment import (
     determine_enrich_mode,
@@ -76,10 +83,12 @@ from app.services.property_enrichment import (
     STRUCTURAL_KEYS,
 )
 from app.services.underwriting_decision import evaluate_underwriting_decision
+from app.services.uw_decision import prepare_decision_payload
 from app.storage.s3 import compute_checksum, put_object, get_object
 from app.jobs.celery_app import overlay_hazard as overlay_task
 from app.jobs.celery_app import rollup_execute as rollup_task
 from app.jobs.celery_app import breach_evaluate as breach_task
+from app.jobs.celery_app import uw_evaluate as uw_eval_task
 from app.jobs.celery_app import compute_resilience_scores as resilience_score_task
 from app.jobs.celery_app import enrich_property_profile as enrich_property_profile_task
 
@@ -330,6 +339,43 @@ class ThresholdRuleCreate(BaseModel):
 class BreachEvalRequest(BaseModel):
     rollup_result_id: int
     threshold_rule_ids: Optional[List[int]] = None
+
+
+class UWRuleCreate(BaseModel):
+    name: str
+    category: str
+    severity: str
+    target: str
+    active: bool = True
+    rule_json: Dict[str, Any]
+
+
+class UWEvalRequest(BaseModel):
+    exposure_version_id: int
+    rollup_result_id: Optional[int] = None
+    uw_rule_ids: Optional[List[int]] = None
+
+
+class UWFindingUpdate(BaseModel):
+    status: Optional[str] = None
+    disposition: Optional[str] = None
+
+
+class UWNoteCreate(BaseModel):
+    entity_type: str
+    entity_id: str
+    note_text: str
+
+
+class UWDecisionCreate(BaseModel):
+    exposure_version_id: int
+    decision: str
+    conditions_json: Optional[List[str]] = None
+    rationale_text: str
+
+
+class ExceptionUpdate(BaseModel):
+    status: str
 
 
 class CommitRequest(BaseModel):
@@ -1215,6 +1261,22 @@ def retry_run(
         )
         new_run.celery_task_id = async_result.id
         db.commit()
+    elif run.run_type == RunType.UW_EVAL:
+        exposure_version_id = (run.input_refs_json or {}).get("exposure_version_id")
+        if exposure_version_id is None:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Missing exposure_version_id for retry")
+        rollup_result_id = (run.input_refs_json or {}).get("rollup_result_id")
+        uw_rule_ids = (run.config_refs_json or {}).get("uw_rule_ids")
+        async_result = uw_eval_task.delay(
+            new_run.id,
+            exposure_version_id,
+            rollup_result_id,
+            uw_rule_ids,
+            user.tenant_id,
+            new_run.request_id,
+        )
+        new_run.celery_task_id = async_result.id
+        db.commit()
     elif run.run_type == RunType.DRIFT:
         drift_run = db.execute(
             select(DriftRun).where(DriftRun.run_id == run.id)
@@ -1274,18 +1336,123 @@ def exposure_exceptions(exposure_version_id: int, user: TokenData = Depends(requ
             ),
         )
     ).scalars().all()
+    triage_rows = db.execute(
+        select(ExceptionTriage)
+        .where(
+            ExceptionTriage.tenant_id == user.tenant_id,
+            ExceptionTriage.exposure_version_id == exposure_version_id,
+        )
+    ).scalars().all()
+    triage_by_key = {row.exception_key: row for row in triage_rows}
+
     items = []
     for loc in quality_rows:
-        items.append({
-            "type": "QUALITY_TIER_C" if (loc.quality_tier == "C") else "LOW_GEO_CONFIDENCE",
+        exc_type = "QUALITY_TIER_C" if (loc.quality_tier == "C") else "LOW_GEO_CONFIDENCE"
+        payload = {
+            "type": exc_type,
+            "location_id": loc.id,
             "external_location_id": loc.external_location_id,
             "quality_tier": loc.quality_tier,
             "reasons": loc.quality_reasons_json or [],
             "geocode_confidence": loc.geocode_confidence,
-        })
+        }
+        key = exception_key(exposure_version_id, exc_type, payload)
+        impact, action = exception_impact_and_action(exc_type, payload)
+        triage = triage_by_key.get(key)
+        items.append(
+            {
+                **payload,
+                "exception_key": key,
+                "status": triage.status if triage else "OPEN",
+                "impact": impact,
+                "recommended_action": action,
+            }
+        )
     for issue in issues:
-        items.append({"type": "VALIDATION_ISSUE", **issue})
+        payload = {"type": "VALIDATION_ISSUE", **issue}
+        key = exception_key(exposure_version_id, "VALIDATION_ISSUE", payload)
+        impact, action = exception_impact_and_action("VALIDATION_ISSUE", payload)
+        triage = triage_by_key.get(key)
+        items.append(
+            {
+                **payload,
+                "exception_key": key,
+                "status": triage.status if triage else "OPEN",
+                "impact": impact,
+                "recommended_action": action,
+            }
+        )
     return {"items": items}
+
+
+@router.patch("/exceptions/{exception_key_value}")
+def update_exception_status(
+    exception_key_value: str,
+    payload: ExceptionUpdate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    status_value = payload.status
+    if status_value not in {"OPEN", "ACKED", "RESOLVED"}:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
+    exposure_version_id = parse_exception_key(exception_key_value)
+    if exposure_version_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid exception key")
+    triage = db.execute(
+        select(ExceptionTriage).where(
+            ExceptionTriage.tenant_id == user.tenant_id,
+            ExceptionTriage.exception_key == exception_key_value,
+        )
+    ).scalar_one_or_none()
+    now = datetime.utcnow()
+    if not triage:
+        triage = ExceptionTriage(
+            tenant_id=user.tenant_id,
+            exposure_version_id=exposure_version_id,
+            exception_key=exception_key_value,
+            exception_type=exception_key_value.split(":", 1)[0],
+            status=status_value,
+            details_json=None,
+            created_at=now,
+            updated_at=now,
+            resolved_at=now if status_value == "RESOLVED" else None,
+        )
+        db.add(triage)
+    else:
+        triage.status = status_value
+        triage.updated_at = now
+        triage.resolved_at = now if status_value == "RESOLVED" else None
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "exception_status_updated", {"exception_key": exception_key_value, "status": status_value})
+    return {
+        "exception_key": triage.exception_key,
+        "status": triage.status,
+        "resolved_at": triage.resolved_at.isoformat() if triage.resolved_at else None,
+    }
+
+
+@router.get("/geocode/autocomplete")
+def geocode_autocomplete(
+    text: str,
+    limit: int = 5,
+    country_code: Optional[str] = None,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+) -> Dict[str, Any]:
+    if not text.strip():
+        return {"suggestions": []}
+    try:
+        suggestions = geoapify_autocomplete(text, limit=limit, country_code=country_code)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Autocomplete request failed") from exc
+    return {"suggestions": suggestions}
 
 
 @router.post("/exposure-versions/{exposure_version_id}/geocode")
@@ -2935,6 +3102,544 @@ def run_breach_eval(
     db.commit()
     emit_audit(db, user.tenant_id, user.user_id, "breach_eval_requested", {"rollup_result_id": payload.rollup_result_id})
     return {"run_id": run.id, "status": run.status}
+
+
+@router.post("/uw-rules")
+def create_uw_rule(
+    payload: UWRuleCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    rule = UWRule(
+        tenant_id=user.tenant_id,
+        name=payload.name,
+        category=payload.category,
+        severity=payload.severity,
+        target=payload.target,
+        active=payload.active,
+        rule_json=payload.rule_json,
+        created_by=user.user_id,
+    )
+    db.add(rule)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "uw_rule_created", {"uw_rule_id": rule.id})
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "category": rule.category,
+        "severity": rule.severity,
+        "target": rule.target,
+        "active": rule.active,
+        "rule_json": rule.rule_json,
+        "created_at": rule.created_at.isoformat(),
+    }
+
+
+@router.get("/uw-rules")
+def list_uw_rules(user: TokenData = Depends(require_role(
+    UserRole.ADMIN.value,
+    UserRole.OPS.value,
+    UserRole.ANALYST.value,
+    UserRole.AUDITOR.value,
+    UserRole.READ_ONLY.value,
+)), db: Session = Depends(get_db)) -> Dict[str, Any]:
+    rows = db.execute(
+        select(UWRule)
+        .where(UWRule.tenant_id == user.tenant_id)
+        .order_by(UWRule.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "name": r.name,
+            "category": r.category,
+            "severity": r.severity,
+            "target": r.target,
+            "active": r.active,
+            "rule_json": r.rule_json,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
+
+
+@router.post("/uw-findings/run")
+def run_uw_eval(
+    payload: UWEvalRequest,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, payload.exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    if payload.rollup_result_id:
+        rr = db.get(RollupResult, payload.rollup_result_id)
+        if not rr or rr.tenant_id != user.tenant_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Rollup result not found")
+    run = Run(
+        tenant_id=user.tenant_id,
+        run_type=RunType.UW_EVAL,
+        status=RunStatus.QUEUED,
+        input_refs_json={
+            "exposure_version_id": payload.exposure_version_id,
+            "rollup_result_id": payload.rollup_result_id,
+        },
+        config_refs_json={"uw_rule_ids": payload.uw_rule_ids or []},
+        created_by=user.user_id,
+        code_version=settings.code_version,
+    )
+    apply_request_id(run)
+    db.add(run)
+    db.commit()
+    async_result = uw_eval_task.delay(
+        run.id,
+        payload.exposure_version_id,
+        payload.rollup_result_id,
+        payload.uw_rule_ids,
+        user.tenant_id,
+        run.request_id,
+    )
+    run.celery_task_id = async_result.id
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "uw_eval_requested", {"exposure_version_id": payload.exposure_version_id})
+    return {"run_id": run.id, "status": run.status}
+
+
+@router.get("/uw-findings")
+def list_uw_findings(
+    exposure_version_id: Optional[int] = None,
+    status_filter: Optional[str] = None,
+    disposition: Optional[str] = None,
+    severity: Optional[str] = None,
+    target: Optional[str] = None,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = (
+        select(
+            UWFinding,
+            UWRule.name.label("rule_name"),
+            UWRule.category.label("rule_category"),
+            UWRule.severity.label("rule_severity"),
+            UWRule.target.label("rule_target"),
+            Location.external_location_id.label("external_location_id"),
+            Location.state_region.label("state_region"),
+            Location.lob.label("lob"),
+            Location.product_code.label("product_code"),
+        )
+        .join(UWRule, UWRule.id == UWFinding.uw_rule_id)
+        .outerjoin(Location, Location.id == UWFinding.location_id)
+        .where(UWFinding.tenant_id == user.tenant_id)
+    )
+    if exposure_version_id:
+        query = query.where(UWFinding.exposure_version_id == exposure_version_id)
+    if status_filter:
+        query = query.where(UWFinding.status == status_filter)
+    if disposition:
+        query = query.where(UWFinding.disposition == disposition)
+    if severity:
+        query = query.where(UWRule.severity == severity)
+    if target:
+        query = query.where(UWRule.target == target)
+    rows = db.execute(query.order_by(UWFinding.last_seen_at.desc())).all()
+    return {"items": [
+        {
+            "id": finding.id,
+            "status": finding.status,
+            "disposition": finding.disposition,
+            "uw_rule_id": finding.uw_rule_id,
+            "rule_name": rule_name,
+            "rule_category": rule_category,
+            "rule_severity": rule_severity,
+            "rule_target": rule_target,
+            "exposure_version_id": finding.exposure_version_id,
+            "location_id": finding.location_id,
+            "external_location_id": external_location_id,
+            "state_region": state_region,
+            "lob": lob,
+            "product_code": product_code,
+            "rollup_result_id": finding.rollup_result_id,
+            "rollup_key_hash": finding.rollup_key_hash,
+            "explanation": finding.explanation_json,
+            "first_seen_at": finding.first_seen_at.isoformat(),
+            "last_seen_at": finding.last_seen_at.isoformat(),
+            "resolved_at": finding.resolved_at.isoformat() if finding.resolved_at else None,
+        }
+        for finding, rule_name, rule_category, rule_severity, rule_target, external_location_id, state_region, lob, product_code in rows
+    ]}
+
+
+@router.patch("/uw-findings/{finding_id}")
+def update_uw_finding(
+    finding_id: int,
+    payload: UWFindingUpdate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    finding = db.get(UWFinding, finding_id)
+    if not finding or finding.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    if payload.status:
+        if payload.status not in {"OPEN", "ACKED", "RESOLVED"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid status")
+        finding.status = payload.status
+        if payload.status == "RESOLVED":
+            finding.resolved_at = datetime.utcnow()
+    if payload.disposition:
+        if payload.disposition not in {"NONE", "REFER", "CONDITION", "DECLINE"}:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid disposition")
+        finding.disposition = payload.disposition
+    finding.last_seen_at = datetime.utcnow()
+    db.commit()
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "uw_finding_updated",
+        {"uw_finding_id": finding.id},
+    )
+    return {
+        "id": finding.id,
+        "status": finding.status,
+        "disposition": finding.disposition,
+        "resolved_at": finding.resolved_at.isoformat() if finding.resolved_at else None,
+    }
+
+
+@router.post("/notes")
+def create_uw_note(
+    payload: UWNoteCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    note = UWNote(
+        tenant_id=user.tenant_id,
+        entity_type=payload.entity_type,
+        entity_id=payload.entity_id,
+        note_text=payload.note_text,
+        created_by=user.user_id,
+    )
+    db.add(note)
+    db.commit()
+    emit_audit(db, user.tenant_id, user.user_id, "note_created", {"note_id": note.id})
+    return {
+        "id": note.id,
+        "entity_type": note.entity_type,
+        "entity_id": note.entity_id,
+        "note_text": note.note_text,
+        "created_at": note.created_at.isoformat(),
+    }
+
+
+@router.get("/notes")
+def list_uw_notes(
+    entity_type: str,
+    entity_id: str,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    rows = db.execute(
+        select(UWNote)
+        .where(
+            UWNote.tenant_id == user.tenant_id,
+            UWNote.entity_type == entity_type,
+            UWNote.entity_id == entity_id,
+        )
+        .order_by(UWNote.created_at.desc())
+    ).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "entity_type": r.entity_type,
+            "entity_id": r.entity_id,
+            "note_text": r.note_text,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
+
+
+@router.post("/decisions")
+def create_uw_decision(
+    payload: UWDecisionCreate,
+    user: TokenData = Depends(require_role(UserRole.ADMIN.value, UserRole.OPS.value, UserRole.ANALYST.value)),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, payload.exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Exposure version not found")
+    decision = db.execute(
+        select(UWDecision).where(
+            UWDecision.tenant_id == user.tenant_id,
+            UWDecision.exposure_version_id == payload.exposure_version_id,
+        )
+    ).scalar_one_or_none()
+    now = datetime.utcnow()
+    existing_payload = {"decision": decision.decision} if decision else None
+    prepared = prepare_decision_payload(
+        existing_payload,
+        {
+            "exposure_version_id": payload.exposure_version_id,
+            "decision": payload.decision,
+            "conditions_json": payload.conditions_json or [],
+            "rationale_text": payload.rationale_text,
+        },
+    )
+    if not decision:
+        decision = UWDecision(
+            tenant_id=user.tenant_id,
+            exposure_version_id=payload.exposure_version_id,
+            decision=prepared["decision"],
+            conditions_json=prepared["conditions_json"],
+            rationale_text=prepared["rationale_text"],
+            created_by=user.user_id,
+            created_at=now,
+        )
+        db.add(decision)
+    else:
+        decision.decision = prepared["decision"]
+        decision.conditions_json = prepared["conditions_json"]
+        decision.rationale_text = prepared["rationale_text"]
+        decision.created_by = user.user_id
+        decision.created_at = now
+    db.commit()
+    emit_audit(
+        db,
+        user.tenant_id,
+        user.user_id,
+        "decision_recorded",
+        prepared["audit_metadata"],
+    )
+    return {
+        "id": decision.id,
+        "exposure_version_id": decision.exposure_version_id,
+        "decision": decision.decision,
+        "conditions_json": decision.conditions_json or [],
+        "rationale_text": decision.rationale_text,
+        "created_at": decision.created_at.isoformat(),
+    }
+
+
+@router.get("/decisions")
+def list_uw_decisions(
+    exposure_version_id: Optional[int] = None,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    query = select(UWDecision).where(UWDecision.tenant_id == user.tenant_id)
+    if exposure_version_id:
+        query = query.where(UWDecision.exposure_version_id == exposure_version_id)
+    rows = db.execute(query.order_by(UWDecision.created_at.desc())).scalars().all()
+    return {"items": [
+        {
+            "id": r.id,
+            "exposure_version_id": r.exposure_version_id,
+            "decision": r.decision,
+            "conditions_json": r.conditions_json or [],
+            "rationale_text": r.rationale_text,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in rows
+    ]}
+
+
+@router.get("/exposure-versions/{exposure_version_id}/uw-summary")
+def exposure_uw_summary(
+    exposure_version_id: int,
+    user: TokenData = Depends(require_role(
+        UserRole.ADMIN.value,
+        UserRole.OPS.value,
+        UserRole.ANALYST.value,
+        UserRole.AUDITOR.value,
+        UserRole.READ_ONLY.value,
+    )),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    ev = db.get(ExposureVersion, exposure_version_id)
+    if not ev or ev.tenant_id != user.tenant_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    tier_rows = db.execute(
+        select(Location.quality_tier, func.count(Location.id))
+        .where(Location.tenant_id == user.tenant_id, Location.exposure_version_id == exposure_version_id)
+        .group_by(Location.quality_tier)
+    ).all()
+    tier_counts = {tier or "UNKNOWN": count for tier, count in tier_rows}
+    low_confidence_count = db.execute(
+        select(func.count(Location.id))
+        .where(
+            Location.tenant_id == user.tenant_id,
+            Location.exposure_version_id == exposure_version_id,
+            Location.geocode_confidence.isnot(None),
+            Location.geocode_confidence < 0.6,
+        )
+    ).scalar_one()
+    validation = db.execute(
+        select(ValidationResult)
+        .where(
+            ValidationResult.upload_id == ev.upload_id,
+            ValidationResult.tenant_id == user.tenant_id,
+        )
+        .order_by(ValidationResult.created_at.desc())
+    ).scalar_one_or_none()
+    validation_summary = validation.summary_json if validation else None
+
+    overlay = db.execute(
+        select(HazardOverlayResult)
+        .where(
+            HazardOverlayResult.tenant_id == user.tenant_id,
+            HazardOverlayResult.exposure_version_id == exposure_version_id,
+        )
+        .order_by(HazardOverlayResult.created_at.desc())
+    ).scalar_one_or_none()
+    hazard_band_rows = []
+    hazard_category_rows = []
+    if overlay:
+        band_expr = LocationHazardAttribute.attributes_json["band"].astext
+        category_expr = LocationHazardAttribute.attributes_json["hazard_category"].astext
+        hazard_band_rows = db.execute(
+            select(
+                band_expr.label("band"),
+                func.count(LocationHazardAttribute.id),
+                func.coalesce(func.sum(Location.tiv), 0.0),
+            )
+            .join(Location, Location.id == LocationHazardAttribute.location_id)
+            .where(
+                LocationHazardAttribute.tenant_id == user.tenant_id,
+                LocationHazardAttribute.hazard_overlay_result_id == overlay.id,
+                Location.tenant_id == user.tenant_id,
+            )
+            .group_by(band_expr)
+        ).all()
+        hazard_category_rows = db.execute(
+            select(
+                category_expr.label("category"),
+                func.count(LocationHazardAttribute.id),
+                func.coalesce(func.sum(Location.tiv), 0.0),
+            )
+            .join(Location, Location.id == LocationHazardAttribute.location_id)
+            .where(
+                LocationHazardAttribute.tenant_id == user.tenant_id,
+                LocationHazardAttribute.hazard_overlay_result_id == overlay.id,
+                Location.tenant_id == user.tenant_id,
+            )
+            .group_by(category_expr)
+        ).all()
+
+    hazard_mix = {
+        "by_band": [
+            {"band": band or "UNKNOWN", "count": count, "tiv_sum": float(tiv_sum or 0.0)}
+            for band, count, tiv_sum in hazard_band_rows
+        ],
+        "by_category": [
+            {"category": category or "UNKNOWN", "count": count, "tiv_sum": float(tiv_sum or 0.0)}
+            for category, count, tiv_sum in hazard_category_rows
+        ],
+        "needs_overlay": overlay is None,
+    }
+
+    rollup = db.execute(
+        select(RollupResult)
+        .where(
+            RollupResult.tenant_id == user.tenant_id,
+            RollupResult.exposure_version_id == exposure_version_id,
+        )
+        .order_by(RollupResult.created_at.desc())
+    ).scalar_one_or_none()
+    top_keys = []
+    needs_rollup = rollup is None
+    if rollup:
+        tiv_expr = func.coalesce(
+            func.cast(RollupResultItem.metrics_json["tiv_sum"].astext, Float), 0.0
+        )
+        rows = db.execute(
+            select(RollupResultItem)
+            .where(
+                RollupResultItem.tenant_id == user.tenant_id,
+                RollupResultItem.rollup_result_id == rollup.id,
+            )
+            .order_by(tiv_expr.desc(), RollupResultItem.id.asc())
+            .limit(10)
+        ).scalars().all()
+        for item in rows:
+            metrics = item.metrics_json or {}
+            top_keys.append(
+                {
+                    "rollup_key": item.rollup_key_json,
+                    "rollup_key_hash": item.rollup_key_hash,
+                    "tiv_sum": metrics.get("tiv_sum", 0.0),
+                    "count": metrics.get("location_count") or metrics.get("count"),
+                }
+            )
+
+    open_breaches = db.execute(
+        select(func.count(Breach.id))
+        .where(
+            Breach.tenant_id == user.tenant_id,
+            Breach.exposure_version_id == exposure_version_id,
+            Breach.status.in_(["OPEN", "ACKED"]),
+        )
+    ).scalar_one()
+    open_uw_findings = db.execute(
+        select(func.count(UWFinding.id))
+        .where(
+            UWFinding.tenant_id == user.tenant_id,
+            UWFinding.exposure_version_id == exposure_version_id,
+            UWFinding.status.in_(["OPEN", "ACKED"]),
+        )
+    ).scalar_one()
+    runs = db.execute(
+        select(Run)
+        .where(
+            Run.tenant_id == user.tenant_id,
+            Run.input_refs_json["exposure_version_id"].astext == str(exposure_version_id),
+        )
+        .order_by(Run.created_at.desc())
+        .limit(10)
+    ).scalars().all()
+    latest_runs = [
+        {
+            "id": r.id,
+            "run_type": r.run_type.value if hasattr(r.run_type, "value") else r.run_type,
+            "status": r.status.value if hasattr(r.status, "value") else r.status,
+            "created_at": r.created_at.isoformat(),
+        }
+        for r in runs
+    ]
+
+    return {
+        "exposure_version": {
+            "id": ev.id,
+            "name": ev.name,
+            "created_at": ev.created_at.isoformat(),
+        },
+        "data_quality": {
+            "tier_counts": tier_counts,
+            "low_confidence_count": low_confidence_count,
+            "validation_warn_error_counts": validation_summary,
+        },
+        "hazard_mix": hazard_mix,
+        "concentration": {"top_keys": top_keys, "needs_rollup": needs_rollup},
+        "controls": {"open_breaches": open_breaches, "open_uw_findings": open_uw_findings},
+        "latest_runs": latest_runs,
+    }
 
 
 @router.get("/breaches")

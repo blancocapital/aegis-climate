@@ -70,6 +70,7 @@ export const ExposureVersionSchema = z.object({
 export type ExposureVersion = z.infer<typeof ExposureVersionSchema>
 
 export const ExposureLocationSchema = z.object({
+  location_id: z.number().optional(),
   external_location_id: z.string().optional(),
   latitude: z.number().nullable().optional(),
   longitude: z.number().nullable().optional(),
@@ -84,6 +85,11 @@ export type ExposureLocation = z.infer<typeof ExposureLocationSchema>
 
 export const ExceptionSchema = z.object({
   type: z.string(),
+  exception_key: z.string().optional(),
+  status: z.string().optional(),
+  impact: z.string().optional(),
+  recommended_action: z.string().optional(),
+  location_id: z.number().optional(),
   external_location_id: z.string().optional(),
   severity: z.string().optional(),
   message: z.string().optional(),
@@ -171,6 +177,71 @@ export const BreachSchema = z.object({
   last_seen_at: z.string().optional(),
 })
 export type Breach = z.infer<typeof BreachSchema>
+
+export const UWRuleSchema = z.object({
+  id: z.number(),
+  name: z.string(),
+  category: z.string(),
+  severity: z.string(),
+  target: z.string(),
+  active: z.boolean().optional(),
+  rule_json: z.any(),
+  created_at: z.string().optional(),
+})
+export type UWRule = z.infer<typeof UWRuleSchema>
+
+export const UWFindingSchema = z.object({
+  id: z.number(),
+  status: z.string(),
+  disposition: z.string(),
+  uw_rule_id: z.number(),
+  rule_name: z.string().optional(),
+  rule_category: z.string().optional(),
+  rule_severity: z.string().optional(),
+  rule_target: z.string().optional(),
+  exposure_version_id: z.number().optional(),
+  location_id: z.number().nullable().optional(),
+  external_location_id: z.string().nullable().optional(),
+  state_region: z.string().nullable().optional(),
+  lob: z.string().nullable().optional(),
+  product_code: z.string().nullable().optional(),
+  rollup_result_id: z.number().nullable().optional(),
+  rollup_key_hash: z.string().nullable().optional(),
+  explanation: z.any().optional(),
+  first_seen_at: z.string().optional(),
+  last_seen_at: z.string().optional(),
+  resolved_at: z.string().nullable().optional(),
+})
+export type UWFinding = z.infer<typeof UWFindingSchema>
+
+export const UWNoteSchema = z.object({
+  id: z.number(),
+  entity_type: z.string(),
+  entity_id: z.string(),
+  note_text: z.string(),
+  created_at: z.string().optional(),
+})
+export type UWNote = z.infer<typeof UWNoteSchema>
+
+export const UWDecisionSchema = z.object({
+  id: z.number(),
+  exposure_version_id: z.number(),
+  decision: z.string(),
+  conditions_json: z.array(z.string()).optional(),
+  rationale_text: z.string(),
+  created_at: z.string().optional(),
+})
+export type UWDecision = z.infer<typeof UWDecisionSchema>
+
+export const UWSummarySchema = z.object({
+  exposure_version: z.record(z.any()),
+  data_quality: z.record(z.any()),
+  hazard_mix: z.record(z.any()),
+  concentration: z.record(z.any()),
+  controls: z.record(z.any()),
+  latest_runs: z.array(z.record(z.any())).optional(),
+}).passthrough()
+export type UWSummary = z.infer<typeof UWSummarySchema>
 
 export const AuditEventSchema = z.object({
   action: z.string(),

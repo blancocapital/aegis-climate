@@ -40,6 +40,7 @@ class RunType(str, enum.Enum):
     DRIFT = "DRIFT"
     RESILIENCE_SCORE = "RESILIENCE_SCORE"
     PROPERTY_ENRICHMENT = "PROPERTY_ENRICHMENT"
+    UW_EVAL = "UW_EVAL"
 
 
 class RunStatus(str, enum.Enum):
@@ -526,4 +527,102 @@ class Breach(Base):
         UniqueConstraint(
             "tenant_id", "threshold_rule_id", "exposure_version_id", "rollup_key_hash", name="uq_breach_unique"
         ),
+    )
+
+
+class UWRule(Base):
+    __tablename__ = "uw_rule"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    name = Column(String, nullable=False)
+    category = Column(String, nullable=False)
+    severity = Column(String, nullable=False)
+    target = Column(String, nullable=False)
+    active = Column(Boolean, nullable=False, default=True)
+    rule_json = Column(JSON, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (Index("ix_uw_rule_tenant_created", "tenant_id", "created_at"),)
+
+
+class UWFinding(Base):
+    __tablename__ = "uw_finding"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    location_id = Column(Integer, ForeignKey("location.id", ondelete="CASCADE"), nullable=True)
+    rollup_result_id = Column(Integer, ForeignKey("rollup_result.id", ondelete="CASCADE"), nullable=True)
+    rollup_key_hash = Column(String, nullable=True)
+    uw_rule_id = Column(Integer, ForeignKey("uw_rule.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String, nullable=False)
+    disposition = Column(String, nullable=False)
+    explanation_json = Column(JSON, nullable=True)
+    first_seen_at = Column(DateTime, nullable=False)
+    last_seen_at = Column(DateTime, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+    last_eval_run_id = Column(Integer, ForeignKey("run.id", ondelete="SET NULL"))
+
+    __table_args__ = (
+        Index("ix_uw_finding_tenant_status_last_seen", "tenant_id", "status", "last_seen_at"),
+        Index("ix_uw_finding_tenant_exposure", "tenant_id", "exposure_version_id"),
+        Index("ix_uw_finding_tenant_rule", "tenant_id", "uw_rule_id"),
+    )
+
+
+class UWNote(Base):
+    __tablename__ = "uw_note"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    entity_type = Column(String, nullable=False)
+    entity_id = Column(String, nullable=False)
+    note_text = Column(Text, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        Index("ix_uw_note_tenant_entity", "tenant_id", "entity_type", "entity_id"),
+        Index("ix_uw_note_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class UWDecision(Base):
+    __tablename__ = "uw_decision"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    decision = Column(String, nullable=False)
+    conditions_json = Column(JSON, nullable=True)
+    rationale_text = Column(Text, nullable=False)
+    created_by = Column(String, ForeignKey("user.id", ondelete="SET NULL"))
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "exposure_version_id", name="uq_uw_decision_exposure"),
+        Index("ix_uw_decision_tenant_created", "tenant_id", "created_at"),
+    )
+
+
+class ExceptionTriage(Base):
+    __tablename__ = "exception_triage"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    tenant_id = Column(String, ForeignKey("tenant.id", ondelete="CASCADE"), nullable=False)
+    exposure_version_id = Column(Integer, ForeignKey("exposure_version.id", ondelete="CASCADE"), nullable=False)
+    exception_key = Column(String, nullable=False)
+    exception_type = Column(String, nullable=False)
+    status = Column(String, nullable=False)
+    details_json = Column(JSON, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
+    resolved_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("tenant_id", "exception_key", name="uq_exception_triage_key"),
+        Index("ix_exception_triage_tenant_status", "tenant_id", "status"),
+        Index("ix_exception_triage_tenant_exposure", "tenant_id", "exposure_version_id"),
     )

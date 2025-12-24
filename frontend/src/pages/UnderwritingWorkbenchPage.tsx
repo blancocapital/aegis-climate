@@ -6,6 +6,7 @@ import {
   UnderwritingPacketResponse,
   UnderwritingPacketSuccess,
 } from '../api/types'
+import { apiRequest } from '../api/client'
 import { Card } from '../components/ui/card'
 import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
@@ -27,6 +28,17 @@ const decisionTone: Record<string, 'default' | 'success' | 'warn' | 'danger'> = 
 }
 
 type UnknownRecord = Record<string, unknown>
+type AutocompleteSuggestion = {
+  formatted?: string
+  address_line1?: string
+  city?: string
+  state_region?: string
+  postal_code?: string
+  country?: string
+  country_code?: string
+  lat?: number
+  lon?: number
+}
 
 function asRecord(value: unknown): UnknownRecord | null {
   return value && typeof value === 'object' ? (value as UnknownRecord) : null
@@ -75,6 +87,9 @@ export function UnderwritingWorkbenchPage() {
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [showRawJson, setShowRawJson] = useState(false)
   const [lastPayload, setLastPayload] = useState<Record<string, unknown> | null>(null)
+  const [suggestions, setSuggestions] = useState<AutocompleteSuggestion[]>([])
+  const [showSuggestions, setShowSuggestions] = useState(false)
+  const [isSuggesting, setIsSuggesting] = useState(false)
   const [form, setForm] = useState({
     address_line1: '',
     city: '',
@@ -160,13 +175,11 @@ export function UnderwritingWorkbenchPage() {
       return
     }
     const payload = {
-      address: {
-        address_line1: form.address_line1,
-        city: form.city,
-        state_region: form.state_region,
-        postal_code: form.postal_code,
-        country: form.country || DEFAULT_COUNTRY,
-      },
+      address_line1: form.address_line1,
+      city: form.city,
+      state_region: form.state_region,
+      postal_code: form.postal_code,
+      country: form.country || DEFAULT_COUNTRY,
       best_effort: form.best_effort,
       wait_for_enrichment_seconds: Number(form.wait_for_enrichment_seconds || 0),
       enrich_mode: form.enrich_mode,
@@ -217,6 +230,54 @@ export function UnderwritingWorkbenchPage() {
   const shouldAutoRetry = Boolean(
     queued && lastPayload && Number(lastPayload.wait_for_enrichment_seconds || 0) > 0
   )
+
+  useEffect(() => {
+    const trimmed = form.address_line1.trim()
+    if (trimmed.length < 3) {
+      setSuggestions([])
+      return
+    }
+    const query = [trimmed, form.city, form.state_region].filter(Boolean).join(' ')
+    const countryCode = (form.country || DEFAULT_COUNTRY).toLowerCase()
+    setIsSuggesting(true)
+    const timer = window.setTimeout(async () => {
+      try {
+        const res = await apiRequest<{ suggestions: AutocompleteSuggestion[] }>({
+          path: '/geocode/autocomplete',
+          params: {
+            text: query,
+            limit: 5,
+            country_code: countryCode,
+          },
+        })
+        setSuggestions(res.suggestions || [])
+        setShowSuggestions(true)
+      } catch (err) {
+        setSuggestions([])
+      } finally {
+        setIsSuggesting(false)
+      }
+    }, 350)
+    return () => window.clearTimeout(timer)
+  }, [form.address_line1, form.city, form.state_region, form.country])
+
+  function applySuggestion(suggestion: AutocompleteSuggestion) {
+    const addressLine = suggestion.address_line1 || suggestion.formatted || form.address_line1
+    const state = suggestion.state_region || form.state_region
+    const city = suggestion.city || form.city
+    const postal = suggestion.postal_code || form.postal_code
+    const country = (suggestion.country_code || suggestion.country || form.country || DEFAULT_COUNTRY).toUpperCase()
+    setForm((prev) => ({
+      ...prev,
+      address_line1: addressLine,
+      city,
+      state_region: state,
+      postal_code: postal,
+      country,
+    }))
+    setSuggestions([])
+    setShowSuggestions(false)
+  }
 
   useEffect(() => {
     if (!queued || isPending || !lastPayload || !shouldAutoRetry) return
@@ -274,11 +335,40 @@ export function UnderwritingWorkbenchPage() {
           <form className="space-y-3" onSubmit={handleSubmit}>
             <div className="space-y-2">
               <label className="text-xs font-semibold uppercase text-slate-500">Address line</label>
-              <Input
-                placeholder="123 Market St"
-                value={form.address_line1}
-                onChange={(e) => setForm((prev) => ({ ...prev, address_line1: e.target.value }))}
-              />
+              <div className="relative">
+                <Input
+                  placeholder="123 Market St"
+                  value={form.address_line1}
+                  onChange={(e) => setForm((prev) => ({ ...prev, address_line1: e.target.value }))}
+                  onFocus={() => setShowSuggestions(true)}
+                  onBlur={() => {
+                    window.setTimeout(() => setShowSuggestions(false), 150)
+                  }}
+                />
+                {showSuggestions && suggestions.length > 0 ? (
+                  <div className="absolute z-20 mt-1 w-full rounded-md border border-slate-200 bg-white shadow-lg">
+                    {suggestions.map((suggestion, idx) => (
+                      <button
+                        type="button"
+                        key={`${suggestion.formatted || suggestion.address_line1 || 'suggestion'}-${idx}`}
+                        className="w-full px-3 py-2 text-left text-sm hover:bg-slate-100"
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => applySuggestion(suggestion)}
+                      >
+                        <div className="font-medium text-slate-800">{suggestion.formatted || suggestion.address_line1}</div>
+                        <div className="text-xs text-slate-500">
+                          {[suggestion.city, suggestion.state_region, suggestion.postal_code, suggestion.country_code]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+                {isSuggesting ? (
+                  <div className="mt-2 text-xs text-slate-500">Fetching suggestions...</div>
+                ) : null}
+              </div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-2">

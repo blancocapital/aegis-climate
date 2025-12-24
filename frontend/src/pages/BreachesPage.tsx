@@ -57,7 +57,10 @@ export function BreachesPage() {
 
   return (
     <Card className="space-y-3">
-      <h2 className="text-lg font-semibold">Breaches</h2>
+      <div>
+        <h2 className="text-lg font-semibold">Portfolio controls</h2>
+        <p className="text-sm text-slate-600">Track threshold breaches and resolve exceptions.</p>
+      </div>
       <div className="flex flex-wrap gap-2">
         <Select value={ruleId?.toString() || ''} onChange={(e) => setRuleId(Number(e.target.value))}>
           <option value="">Rule</option>

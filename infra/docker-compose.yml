@@ -37,6 +37,7 @@ services:
       AEGIS_MINIO_BUCKET: aegis-data
       AEGIS_SECRET_KEY: devsecret
       AEGIS_CODE_VERSION: dev
+      AEGIS_GEOAPIFY_API_KEY: ${AEGIS_GEOAPIFY_API_KEY}
     ports:
       - "8000:8000"
     depends_on:
@@ -58,6 +59,7 @@ services:
       AEGIS_MINIO_BUCKET: aegis-data
       AEGIS_SECRET_KEY: devsecret
       AEGIS_CODE_VERSION: dev
+      AEGIS_GEOAPIFY_API_KEY: ${AEGIS_GEOAPIFY_API_KEY}
     depends_on:
       - postgres
       - redis

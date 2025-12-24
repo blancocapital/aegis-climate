@@ -1,7 +1,7 @@
 import { useParams } from 'react-router-dom'
 import { ColumnDef } from '@tanstack/react-table'
 import { useState } from 'react'
-import { useExposureLocations, useExposureVersion } from '../api/hooks'
+import { useExposureLocations, useExposureVersion, useUWSummary } from '../api/hooks'
 import { ExposureLocation } from '../api/types'
 import { Card } from '../components/ui/card'
 import { DataTable } from '../components/DataTable'
@@ -15,6 +15,7 @@ import { Badge } from '../components/ui/badge'
 export function ExposureVersionDetailPage() {
   const { id } = useParams()
   const { data } = useExposureVersion(id)
+  const uwSummary = useUWSummary(id)
   const { data: locations = [] } = useExposureLocations(id, { limit: 100 })
   const [geocodeRunId, setGeocodeRunId] = useState<number | null>(null)
   const runQuery = useRun(geocodeRunId || undefined, Boolean(geocodeRunId))
@@ -47,6 +48,14 @@ export function ExposureVersionDetailPage() {
           {geocodeRunId && <Badge>{runQuery.data?.status || 'PENDING'}</Badge>}
         </div>
       </div>
+      <Card className="grid grid-cols-2 gap-2 text-sm">
+        <div>Tier C count: {uwSummary.data?.data_quality?.tier_counts?.C ?? 0}</div>
+        <div>High hazard count: {(uwSummary.data?.hazard_mix?.by_band || []).filter((b: any) =>
+          ['HIGH', 'EXTREME'].includes(String(b.band || '').toUpperCase())
+        ).reduce((acc: number, b: any) => acc + Number(b.count || 0), 0)}</div>
+        <div>Open findings: {uwSummary.data?.controls?.open_uw_findings ?? 0}</div>
+        <div>Open breaches: {uwSummary.data?.controls?.open_breaches ?? 0}</div>
+      </Card>
       <Card className="grid grid-cols-2 gap-2 text-sm">
         <div>Locations: {data?.location_count ?? '-'}</div>
         <div>TIV sum: {formatNumber(data?.tiv_sum)}</div>

@@ -11,6 +11,7 @@ let exposureVersionId: number | null = null
 let overlayResultId: number | null = null
 let rollupResultId: number | null = null
 let thresholdRuleId: number | null = null
+let uwRuleName: string | null = null
 
 async function extractRunIdFromText(text?: string | null) {
   if (!text) return null
@@ -199,6 +200,47 @@ test.describe.serial('End-to-end flows', () => {
     await firstRow.getByRole('button', { name: 'Resolve' }).click()
     await expect(firstRow.getByText(/RESOLVED/)).toBeVisible({ timeout: 120000 })
 
+    expect(readErrors()).toEqual([])
+  })
+
+  test('Underwriting rules + findings + decision', async ({ page }) => {
+    test.skip(!exposureVersionId, 'Exposure version required')
+    const readErrors = attachConsoleErrorLogger(page, ['Failed to load source map'])
+    await login(page)
+
+    await page.getByRole('link', { name: 'Appetite & Referral Rules' }).click()
+    await expect(page.getByRole('heading', { name: 'Appetite & referral rules' })).toBeVisible()
+    uwRuleName = `UW Rule ${Date.now()}`
+    await page.getByPlaceholder('Rule name').fill(uwRuleName)
+    await page.getByPlaceholder('Value (comma separated for lists)').fill('0')
+    await page.getByRole('button', { name: 'Create rule' }).click()
+    await expect(page.getByText(uwRuleName)).toBeVisible()
+
+    await page.getByRole('link', { name: 'Submission Workbench' }).click()
+    await page.locator('select').first().selectOption(exposureVersionId!.toString())
+    await page.getByRole('button', { name: 'Run UW eval' }).click()
+    await expect(page.getByText(/QUEUED|RUNNING|SUCCEEDED|FAILED/)).toBeVisible()
+
+    const findingRows = page.locator('table tbody tr')
+    await expect.poll(async () => await findingRows.count(), { timeout: 180000 }).toBeGreaterThan(0)
+
+    await page.getByRole('link', { name: 'Referrals' }).click()
+    await page.locator('select').first().selectOption(exposureVersionId!.toString())
+    await expect.poll(async () => await page.locator('table tbody tr').count(), { timeout: 180000 }).toBeGreaterThan(0)
+    await page.getByRole('button', { name: 'View' }).first().click()
+    await page.getByRole('button', { name: 'Ack' }).click()
+    await page.getByPlaceholder('Add a note').fill('Reviewed and acknowledged.')
+    await page.getByRole('button', { name: 'Add note' }).click()
+    await expect(page.getByText('Reviewed and acknowledged.')).toBeVisible()
+
+    await page.getByRole('link', { name: 'Submission Workbench' }).click()
+    await page.locator('select').first().selectOption(exposureVersionId!.toString())
+    await page.getByPlaceholder('Decision rationale').fill('Proceed with standard terms.')
+    await page.getByRole('button', { name: 'Record decision' }).click()
+    await expect(page.getByText(/Last decision/)).toBeVisible()
+
+    await page.getByRole('link', { name: 'Audit Log' }).click()
+    await expect(page.getByText(/uw_rule_created|uw_eval_requested|decision_recorded/)).toBeVisible()
     expect(readErrors()).toEqual([])
   })
 })
