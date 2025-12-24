@@ -242,14 +242,16 @@ export function UnderwritingWorkbenchPage() {
   const shouldAutoRetry = Boolean(
     queued && lastPayload && Number(lastPayload.wait_for_enrichment_seconds || 0) > 0
   )
+  const trimmedAddress = form.address_line1.trim()
 
   useEffect(() => {
-    const trimmed = form.address_line1.trim()
-    if (trimmed.length < 3) {
+    if (trimmedAddress.length < 3) {
       setSuggestions([])
       return
     }
-    const query = [trimmed, form.city, form.state_region].filter(Boolean).join(' ')
+    const query = [trimmedAddress, form.city, form.state_region, form.postal_code, countryCode.toUpperCase()]
+      .filter(Boolean)
+      .join(' ')
     setIsSuggesting(true)
     const timer = window.setTimeout(async () => {
       try {
@@ -270,7 +272,7 @@ export function UnderwritingWorkbenchPage() {
       }
     }, 350)
     return () => window.clearTimeout(timer)
-  }, [form.address_line1, form.city, form.state_region, form.country])
+  }, [trimmedAddress, form.city, form.state_region, form.postal_code, countryCode])
 
   function applySuggestion(suggestion: AutocompleteSuggestion) {
     const addressLine = suggestion.address_line1 || suggestion.formatted || form.address_line1
@@ -381,13 +383,18 @@ export function UnderwritingWorkbenchPage() {
                 {isSuggesting ? (
                   <div className="mt-2 text-xs text-slate-500">Fetching suggestions...</div>
                 ) : null}
+                {showSuggestions && !isSuggesting && trimmedAddress.length >= 3 && suggestions.length === 0 ? (
+                  <div className="mt-2 text-xs text-slate-500">
+                    No matches yet. Try adding city, province, or postal code.
+                  </div>
+                ) : null}
               </div>
             </div>
             <div className="grid grid-cols-2 gap-2">
               <div className="space-y-2">
                 <label className="text-xs font-semibold uppercase text-slate-500">City</label>
                 <Input
-                  placeholder="San Francisco"
+                  placeholder={isCanada ? 'Toronto' : 'San Francisco'}
                   value={form.city}
                   onChange={(e) => setForm((prev) => ({ ...prev, city: e.target.value }))}
                 />
